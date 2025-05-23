@@ -39,5 +39,5 @@ Pod::Spec.new do |s|
     'CLANG_CXX_LIBRARY' => 'libc++'
   }
   s.prepare_command = './prepare.sh'
-  s.vendored_libraries = 'third_party/sfizz/build/libsfizz_fat.a'
+  s.vendored_frameworks = Dir['third_party/sfizz/xcframeworks/*.xcframework']
 end
