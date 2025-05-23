@@ -15,9 +15,11 @@ Pod::Spec.new do |s|
   s.resource_bundles = {
     'flutter_sequencer' => ['prepare.sh']
   }
+
   s.xcconfig = {
-    'USER_HEADER_SEARCH_PATHS' => '"${PROJECT_DIR}/.."/Classes/CallbackManager/*,"${PROJECT_DIR}/.."/Classes/Scheduler/*,"${PROJECT_DIR}/.."/Classes/AudioUnit/Sfizz/SfizzDSPKernelAdapter.h',
+    'HEADER_SEARCH_PATHS' => '$(PODS_TARGET_SRCROOT)/third_party/sfizz/src'
   }
+
   s.dependency 'Flutter'
   s.static_framework = true
   s.platform = :ios, '13.0'
