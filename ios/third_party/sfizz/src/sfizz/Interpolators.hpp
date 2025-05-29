@@ -12,7 +12,22 @@
 #if SIMDE_NATURAL_VECTOR_SIZE_GE(128)
 #include <simde/x86/sse.h>
 #include <simde/arm/neon/addv.h>
+
+#if defined(SIMDE_ARM_NEON_A32V7_NATIVE)
+    #define simde__m128_to_simde_float32x4(a) simde__m128_to_neon_f32((a))
+#elif defined(SIMDE_X86_SSE_NATIVE)
+    #define simde__m128_to_simde_float32x4(a) simde_float32x4_from_m128(simde__m128_to_private((a)).n)
+#elif defined(SIMDE_STATEMENT_EXPR_)
+    #define simde__m128_to_simde_float32x4(a) SIMDE_STATEMENT_EXPR_(({ \
+        simde__m128_private a_ = simde__m128_to_private((a)); \
+        simde_float32x4_private r_; \
+        r_.values = a_.f32; \
+        simde_float32x4_from_private(r_); \
+    }))
 #endif
+
+#endif /* SIMDE_NATURAL_VECTOR_SIZE_GE(128) */
+
 
 namespace sfz {
 
@@ -64,7 +79,7 @@ public:
         simde__m128 x = simde_mm_sub_ps(simde_mm_setr_ps(-1, 0, 1, 2), simde_mm_set1_ps(coeff));
         simde__m128 h = hermite3x4(x);
         simde__m128 y = simde_mm_mul_ps(h, simde_mm_loadu_ps(values - 1));
-        return simde_vaddvq_f32(y);
+        return simde_vaddvq_f32(simde__m128_to_simde_float32x4(y));
     }
 };
 #endif
@@ -100,7 +115,7 @@ public:
         simde__m128 x = simde_mm_sub_ps(simde_mm_setr_ps(-1, 0, 1, 2), simde_mm_set1_ps(coeff));
         simde__m128 h = bspline3x4(x);
         simde__m128 y = simde_mm_mul_ps(h, simde_mm_loadu_ps(values - 1));
-        return simde_vaddvq_f32(y);
+        return simde_vaddvq_f32(simde__m128_to_simde_float32x4(y));
     }
 };
 #endif
@@ -203,7 +218,7 @@ public:
             i += 4;
         } while (i < Points);
 
-        return simde_vaddvq_f32(y);
+        return simde_vaddvq_f32(simde__m128_to_simde_float32x4(y));
     }
 };
 #endif

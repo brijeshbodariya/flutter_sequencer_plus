@@ -6,6 +6,7 @@
 
 #include "DecentSampler.h"
 #include "sfizz/Opcode.h"
+#include "utility/U8Strings.h"
 #include <absl/strings/match.h>
 #include <absl/strings/string_view.h>
 #include <absl/memory/memory.h>
@@ -29,7 +30,7 @@ const char* DecentSamplerInstrumentFormat::name() const noexcept
 
 bool DecentSamplerInstrumentFormat::matchesFilePath(const fs::path& path) const
 {
-    const std::string ext = path.extension().u8string();
+    const std::string ext = u8EncodedString(path.extension());
     return absl::EqualsIgnoreCase(ext, ".dspreset");
 }
 
@@ -202,7 +203,7 @@ void DecentSamplerInstrumentImporter::emitRegionalOpcodes(std::ostream& os, pugi
             break;
         case hash("loopEnabled"):
             os << "loop_mode="
-               << ((xmlOpcode.value == "true") ? "loop_continuous" : "one_shot") << "\n";
+               << ((xmlOpcode.value == "true") ? "loop_continuous" : "no_loop") << "\n";
             break;
         case hash("attack"):
             convertToReal("ampeg_attack");

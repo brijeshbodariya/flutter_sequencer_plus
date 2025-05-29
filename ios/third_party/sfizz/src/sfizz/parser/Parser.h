@@ -6,7 +6,7 @@
 
 #pragma once
 #include "../Opcode.h"
-#include <ghc/fs_std.hpp>
+#include <ghc/fs_std.hpp> // Use GHC filesystem for iOS compatibility
 #include <absl/types/optional.h>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>

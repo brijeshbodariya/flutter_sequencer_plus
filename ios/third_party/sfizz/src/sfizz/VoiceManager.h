@@ -81,6 +81,13 @@ struct VoiceManager final : public Voice::StateListener
     const PolyphonyGroup* getPolyphonyGroupView(int idx) noexcept;
 
     /**
+     * @brief Get the actives voices as a view
+     *
+     * @return std::vector<const Voice*>
+     */
+    std::vector<const Voice*> getActiveVoices() const noexcept;
+
+    /**
      * @brief Clear all voices and polyphony groups.
      * Also resets the stealing algorithm to default.
      */
@@ -132,9 +139,18 @@ struct VoiceManager final : public Voice::StateListener
      */
     void requireNumVoices(int numVoices, Resources& resources);
 
+    /**
+     * @brief Is this timestamp within the lo/hitimer range for this region based on current group activity
+     *
+     * @param region
+     * @param timestampSamples in samples
+     * @param sampleRate
+     * @return bool
+     */
+    bool withinValidTimerRange(const Region* region, unsigned timestampSamples, float sampleRate) const noexcept;
+
 private:
     int numRequiredVoices_ { config::numVoices };
-    int getNumEffectiveVoices() const noexcept { return config::calculateActualVoices(numRequiredVoices_); }
     std::vector<Voice> list_;
     std::vector<Voice*> activeVoices_;
     std::vector<Voice*> temp_;

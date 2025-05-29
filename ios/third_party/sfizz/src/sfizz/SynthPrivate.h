@@ -89,6 +89,12 @@ struct Synth::Impl final: public Parser::Listener {
      */
     void handleEffectOpcodes(const std::vector<Opcode>& members);
     /**
+     * @brief Helper function to dispatch <effect> opcodes
+     *
+     * @param members the opcodes of the <effect> block
+     */
+    void handleSampleOpcodes(const std::vector<Opcode>& members);
+    /**
      * @brief Helper function to merge all the currently active opcodes
      * as set by the successive callbacks and create a new region to store
      * in the synth.
@@ -144,8 +150,9 @@ struct Synth::Impl final: public Parser::Listener {
      * @param delay
      * @param ccNumber
      * @param value
+     * @param extendedArg used for some extendedCC (eg. polyaftertouch note num, etc)
      */
-    void ccDispatch(int delay, int ccNumber, float value) noexcept;
+    void ccDispatch(int delay, int ccNumber, float value, int extendedArg=-1) noexcept;
 
     /**
      * @brief Start a voice for a specific region.
@@ -177,10 +184,32 @@ struct Synth::Impl final: public Parser::Listener {
     void startDelayedSostenutoReleases(Layer* layer, int delay, SisterVoiceRingBuilder& ring) noexcept;
 
     /**
+     * @brief Reset the default CCs
+     *
+     */
+    void resetDefaultCCValues() noexcept;
+
+    /**
+     * @brief Prepare before loading a new SFZ file. The behavior of this function
+     * is changed by the reloading state.
+     *
+     * @param path
+     */
+    void prepareSfzLoad(const fs::path& path);
+
+    /**
      * @brief Finalize SFZ loading, following a successful execution of the
-     *        parsing step.
+     * parsing step. The behavior of this function is changed by the reloading
+     * state.
      */
     void finalizeSfzLoad();
+
+    /**
+     * @brief Set the current keyswitch, taking into account octave offsets and the like.
+     *
+     * @param noteValue
+     */
+    void setCurrentSwitch(uint8_t noteValue);
 
     template<class T>
     static void collectUsedCCsFromCCMap(BitArray<config::numCCs>& usedCCs, const CCMap<T> map) noexcept
@@ -211,8 +240,9 @@ struct Synth::Impl final: public Parser::Listener {
      * @param ccNumber   The CC number
      * @param normValue  The normalized value
      * @param asMidi     Whether to process as a MIDI event
+     * @param extendedArg for some extendedCC (eg. polyaftertouch: note num, etc)
      */
-    void performHdcc(int delay, int ccNumber, float normValue, bool asMidi) noexcept;
+    void performHdcc(int delay, int ccNumber, float normValue, bool asMidi, int extendedArg=-1) noexcept;
 
     /**
      * @brief Set the default value for a CC
@@ -230,10 +260,16 @@ struct Synth::Impl final: public Parser::Listener {
      * @param delay
      * @param number
      */
-    void checkOffGroups(const Region* region, int delay, int number);
+    void checkOffGroups(const Region* region, int delay, int number, bool chokedByCC = false);
+
+    /**
+     * @brief Resets the callback duration breakdown to 0
+     */
+    void resetCallbackBreakdown();
 
     int numGroups_ { 0 };
     int numMasters_ { 0 };
+    int numOutputs_ { 1 };
 
     // Opcode memory; these are used to build regions, as a new region
     // will integrate opcodes from the group, master and global block
@@ -248,6 +284,7 @@ struct Synth::Impl final: public Parser::Listener {
     std::map<int, size_t> keyLabelsMap_;
     BitArray<128> keySlots_;
     BitArray<128> swLastSlots_;
+    BitArray<128> sustainOrSostenuto_;
     std::vector<NoteNamePair> keyswitchLabels_;
     std::map<int, size_t> keyswitchLabelsMap_;
 
@@ -277,7 +314,10 @@ struct Synth::Impl final: public Parser::Listener {
     // Effect factory and buses
     EffectFactory effectFactory_;
     typedef std::unique_ptr<EffectBus> EffectBusPtr;
-    std::vector<EffectBusPtr> effectBuses_; // 0 is "main", 1-N are "fx1"-"fxN"
+    std::vector<std::vector<EffectBusPtr>> effectBuses_; // first index is the output, then 0 is "main", 1-N are "fx1"-"fxN"
+    const std::vector<EffectBusPtr>& getEffectBusesForOutput(uint16_t numOutput) { return effectBuses_[numOutput]; }
+    void initEffectBuses();
+    void addEffectBusesIfNecessary(uint16_t output);
 
     int samplesPerBlock_ { config::defaultSamplesPerBlock };
     float sampleRate_ { config::defaultSampleRate };
@@ -296,6 +336,7 @@ struct Synth::Impl final: public Parser::Listener {
     // Control opcodes
     std::string defaultPath_ { "" };
     std::string image_ { "" };
+    std::string image_controls_ { "" };
     int noteOffset_ { Default::noteOffset };
     int octaveOffset_ { Default::octaveOffset };
 
@@ -320,12 +361,15 @@ struct Synth::Impl final: public Parser::Listener {
         bool haveFilterLFO { false };
     } settingsPerVoice_;
 
-    Duration dispatchDuration_ { 0 };
+    CallbackBreakdown callbackBreakdown_;
+    double dispatchDuration_ { 0 };
 
     std::chrono::time_point<std::chrono::high_resolution_clock> lastGarbageCollection_;
 
     Parser parser_;
+    std::string lastPath_;
     absl::optional<fs::file_time_type> modificationTime_ { };
+    bool reloading { false };
 
     std::array<float, config::numCCs> defaultCCValues_ { };
     BitArray<config::numCCs> currentUsedCCs_;

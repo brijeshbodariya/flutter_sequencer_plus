@@ -8,6 +8,7 @@
 #include "Config.h"
 #include "utility/Debug.h"
 #include "utility/Macros.h"
+#include "utility/U8Strings.h"
 #include "modulations/ModId.h"
 #include "modulations/ModKey.h"
 #include "modulations/ModMatrix.h"
@@ -24,13 +25,16 @@
 #include "Metronome.h"
 #include "SynthConfig.h"
 #include "ScopedFTZ.h"
+#include "utility/Base64.h"
 #include "utility/StringViewHelpers.h"
+#include "utility/Timing.h"
 #include "utility/XmlHelpers.h"
 #include "Voice.h"
 #include "Interpolators.h"
 #include "parser/Parser.h"
 #include <absl/algorithm/container.h>
 #include <absl/memory/memory.h>
+#include <absl/strings/str_cat.h>
 #include <absl/strings/str_replace.h>
 #include <absl/types/optional.h>
 #include <absl/types/span.h>
@@ -63,8 +67,10 @@ Synth::Impl::Impl()
 
     parser_.setListener(this);
     effectFactory_.registerStandardEffectTypes();
-    effectBuses_.reserve(5); // sufficient room for main and fx1-4
+    initEffectBuses();
     resetVoices(config::numVoices);
+    resetDefaultCCValues();
+    resetAllControllers(0);
 
     // modulation sources
     MidiState& midiState = resources_.getMidiState();
@@ -126,6 +132,9 @@ void Synth::Impl::onParseFullBlock(const std::string& header, const std::vector<
         break;
     case hash("effect"):
         handleEffectOpcodes(members);
+        break;
+    case hash("sample"):
+        handleSampleOpcodes(members);
         break;
     default:
         std::cerr << "Unknown header: " << header << '\n';
@@ -202,7 +211,7 @@ void Synth::Impl::buildRegion(const std::vector<Opcode>& regionOpcodes)
         previousKeyswitchLists_.push_back(lastLayer);
 
     if (lastRegion->defaultSwitch)
-        currentSwitch_ = *lastRegion->defaultSwitch;
+        setCurrentSwitch(*lastRegion->defaultSwitch);
 
     // There was a combination of group= and polyphony= on a region, so set the group polyphony
     if (lastRegion->group != Default::group && lastRegion->polyphony != config::maxVoices) {
@@ -229,6 +238,27 @@ void Synth::Impl::buildRegion(const std::vector<Opcode>& regionOpcodes)
     lastLayer->initializeActivations();
 }
 
+void Synth::Impl::addEffectBusesIfNecessary(uint16_t output)
+{
+    while (effectBuses_.size() <= output) {
+        // Add output
+        effectBuses_.emplace_back();
+        auto& buses = effectBuses_.back();
+        // Add an empty main bus on output
+        buses.emplace_back(new EffectBus);
+        buses[0]->setGainToMain(1.0);
+        buses[0]->setSamplesPerBlock(samplesPerBlock_);
+        buses[0]->setSampleRate(sampleRate_);
+        buses[0]->clearInputs(samplesPerBlock_);
+    }
+}
+
+void Synth::Impl::initEffectBuses()
+{
+    effectBuses_.clear();
+    addEffectBusesIfNecessary(0);
+}
+
 void Synth::Impl::clear()
 {
     FilePool& filePool = resources_.getFilePool();
@@ -253,24 +283,22 @@ void Synth::Impl::clear()
     currentSet_ = nullptr;
     sets_.clear();
     layers_.clear();
-    effectBuses_.clear();
-    effectBuses_.emplace_back(new EffectBus);
-    effectBuses_[0]->setGainToMain(1.0);
-    effectBuses_[0]->setSamplesPerBlock(samplesPerBlock_);
-    effectBuses_[0]->setSampleRate(sampleRate_);
-    effectBuses_[0]->clearInputs(samplesPerBlock_);
-    resources_.clear();
+    resources_.clearNonState();
     rootPath_.clear();
     numGroups_ = 0;
     numMasters_ = 0;
+    numOutputs_ = 1;
+    noteOffset_ = 0;
+    octaveOffset_ = 0;
     currentSwitch_ = absl::nullopt;
     defaultPath_ = "";
     image_ = "";
-    midiState.reset();
-    filePool.clear();
+    midiState.resetNoteStates();
+    midiState.flushEvents();
     filePool.setRamLoading(config::loadInRam);
     clearCCLabels();
     currentUsedCCs_.clear();
+    sustainOrSostenuto_.clear();
     changedCCsThisCycle_.clear();
     changedCCsLastCycle_.clear();
     clearKeyLabels();
@@ -284,17 +312,7 @@ void Synth::Impl::clear()
     modificationTime_ = absl::nullopt;
     playheadMoved_ = false;
 
-    // set default controllers
-    // midistate is reset above
-    fill(absl::MakeSpan(defaultCCValues_), 0.0f);
-    setDefaultHdcc(7, normalizeCC(100));
-    setDefaultHdcc(10, 0.5f);
-    setDefaultHdcc(11, 1.0f);
-
-    // set default controller labels
-    setCCLabel(7, "Volume");
-    setCCLabel(10, "Pan");
-    setCCLabel(11, "Expression");
+    initEffectBuses();
 }
 
 void Synth::Impl::handleMasterOpcodes(const std::vector<Opcode>& members)
@@ -308,7 +326,7 @@ void Synth::Impl::handleMasterOpcodes(const std::vector<Opcode>& members)
             currentSet_->setPolyphonyLimit(member.read(Default::polyphony));
             break;
         case hash("sw_default"):
-            currentSwitch_ = member.read(Default::key);
+            setCurrentSwitch(member.read(Default::key));
             break;
         }
     }
@@ -325,7 +343,7 @@ void Synth::Impl::handleGlobalOpcodes(const std::vector<Opcode>& members)
             currentSet_->setPolyphonyLimit(member.read(Default::polyphony));
             break;
         case hash("sw_default"):
-            currentSwitch_ = member.read(Default::key);
+            setCurrentSwitch(member.read(Default::key));
             break;
         case hash("volume"):
             // FIXME : Probably best not to mess with this and let the host control the volume
@@ -337,7 +355,7 @@ void Synth::Impl::handleGlobalOpcodes(const std::vector<Opcode>& members)
 
 void Synth::Impl::handleGroupOpcodes(const std::vector<Opcode>& members, const std::vector<Opcode>& masterMembers)
 {
-    absl::optional<int> groupIdx;
+    absl::optional<int64_t> groupIdx;
     absl::optional<unsigned> maxPolyphony;
 
     const auto parseOpcode = [&](const Opcode& rawMember) {
@@ -351,7 +369,7 @@ void Synth::Impl::handleGroupOpcodes(const std::vector<Opcode>& members, const s
             maxPolyphony = member.read(Default::polyphony);
             break;
         case hash("sw_default"):
-            currentSwitch_ = member.read(Default::key);
+            setCurrentSwitch(member.read(Default::key));
             break;
         }
     };
@@ -380,12 +398,20 @@ void Synth::Impl::handleControlOpcodes(const std::vector<Opcode>& members)
         switch (member.lettersOnlyHash) {
         case hash("set_cc&"):
             if (Default::ccNumber.bounds.containsWithEnd(member.parameters.back())) {
-                setDefaultHdcc(member.parameters.back(), member.read(Default::loCC));
+                const auto ccNumber = member.parameters.back();
+                const auto value = member.read(Default::loCC);
+                setDefaultHdcc(ccNumber, value);
+                if (!reloading)
+                    resources_.getMidiState().ccEvent(0, ccNumber, value);
             }
             break;
         case hash("set_hdcc&"):
             if (Default::ccNumber.bounds.containsWithEnd(member.parameters.back())) {
-                setDefaultHdcc(member.parameters.back(), member.read(Default::loNormalized));
+                const auto ccNumber = member.parameters.back();
+                const auto value = member.read(Default::loNormalized);
+                setDefaultHdcc(ccNumber, value);
+                if (!reloading)
+                    resources_.getMidiState().ccEvent(0, ccNumber, value);
             }
             break;
         case hash("label_cc&"):
@@ -405,6 +431,9 @@ void Synth::Impl::handleControlOpcodes(const std::vector<Opcode>& members)
         case hash("image"):
             image_ = absl::StrCat(defaultPath_, absl::StrReplaceAll(trim(member.value), { { "\\", "/" } }));
             break;
+        case hash("image_controls"):
+            image_controls_ = absl::StrCat(defaultPath_, absl::StrReplaceAll(trim(member.value), { { "\\", "/" } }));
+            break;
         case hash("note_offset"):
             noteOffset_ = member.read(Default::noteOffset);
             break;
@@ -414,14 +443,8 @@ void Synth::Impl::handleControlOpcodes(const std::vector<Opcode>& members)
         case hash("hint_ram_based"):
         {
             FilePool& filePool = resources_.getFilePool();
-            if (member.value == "1")
-                filePool.setRamLoading(true);
-            else if (member.value == "0")
-                filePool.setRamLoading(false);
-            else
-                DBG("Unsupported value for hint_ram_based: " << member.value);
-            break;
-        }
+            filePool.setRamLoading(member.read(Default::ramBased));
+        } break;
         case hash("hint_stealing"):
             switch(hash(member.value)) {
             case hash("first"):
@@ -450,14 +473,27 @@ void Synth::Impl::handleControlOpcodes(const std::vector<Opcode>& members)
     }
 }
 
+
 void Synth::Impl::handleEffectOpcodes(const std::vector<Opcode>& rawMembers)
 {
-    absl::string_view busName = "main";
+    absl::string_view busName { "main" };
+    uint16_t output { Default::output };
 
-    auto getOrCreateBus = [this](unsigned index) -> EffectBus& {
-        if (index + 1 > effectBuses_.size())
-            effectBuses_.resize(index + 1);
-        EffectBusPtr& bus = effectBuses_[index];
+    std::vector<Opcode> members;
+    members.reserve(rawMembers.size());
+    for (const Opcode& opcode : rawMembers) {
+        if (opcode.lettersOnlyHash == hash("output"))
+            output = opcode.read(Default::output);
+
+        members.push_back(opcode.cleanUp(kOpcodeScopeEffect));
+    }
+
+    addEffectBusesIfNecessary(output);
+
+    auto getOrCreateBus = [this, output](unsigned index) -> EffectBus& {
+        if (index + 1 > effectBuses_[output].size())
+            effectBuses_[output].resize(index + 1);
+        EffectBusPtr& bus = effectBuses_[output][index];
         if (!bus) {
             bus.reset(new EffectBus);
             bus->setSampleRate(sampleRate_);
@@ -466,11 +502,6 @@ void Synth::Impl::handleEffectOpcodes(const std::vector<Opcode>& rawMembers)
         }
         return *bus;
     };
-
-    std::vector<Opcode> members;
-    members.reserve(rawMembers.size());
-    for (const Opcode& opcode : rawMembers)
-        members.push_back(opcode.cleanUp(kOpcodeScopeEffect));
 
     for (const Opcode& opcode : members) {
         switch (opcode.lettersOnlyHash) {
@@ -485,15 +516,21 @@ void Synth::Impl::handleEffectOpcodes(const std::vector<Opcode>& rawMembers)
             break;
 
         case hash("fx&tomain"): // fx&tomain
-            if (opcode.parameters.front() < 1 || opcode.parameters.front() > config::maxEffectBuses)
-                break;
-            getOrCreateBus(opcode.parameters.front()).setGainToMain(opcode.read(Default::effect));
+            {
+                const auto busIndex = opcode.parameters.front();
+                if (busIndex < 1 || busIndex > config::maxEffectBuses)
+                    break;
+                getOrCreateBus(busIndex).setGainToMain(opcode.read(Default::effect));
+            }
             break;
 
         case hash("fx&tomix"): // fx&tomix
-            if (opcode.parameters.front() < 1 || opcode.parameters.front() > config::maxEffectBuses)
-                break;
-            getOrCreateBus(opcode.parameters.front()).setGainToMix(opcode.read(Default::effect));
+            {
+                const auto busIndex = opcode.parameters.front();
+                if (busIndex < 1 || busIndex > config::maxEffectBuses)
+                    break;
+                getOrCreateBus(busIndex).setGainToMix(opcode.read(Default::effect));
+            }
             break;
         }
     }
@@ -509,22 +546,100 @@ void Synth::Impl::handleEffectOpcodes(const std::vector<Opcode>& rawMembers)
     }
 
     // create the effect and add it
-    EffectBus& bus = getOrCreateBus(busIndex);
     auto fx = effectFactory_.makeEffect(members);
     fx->setSampleRate(sampleRate_);
     fx->setSamplesPerBlock(samplesPerBlock_);
-    bus.addEffect(std::move(fx));
+    getOrCreateBus(busIndex).addEffect(std::move(fx));
+}
+
+void Synth::Impl::handleSampleOpcodes(const std::vector<Opcode>& rawMembers)
+{
+    absl::string_view name { "" };
+    bool hasData { false };
+    absl::string_view sampleData;
+
+    for (const Opcode& opcode : rawMembers) {
+        switch (opcode.lettersOnlyHash) {
+        case hash("name"):
+            name = opcode.value;
+            break;
+        case hash("base&data"):
+            if (opcode.parameters.front() == 64)
+                sampleData = opcode.value;
+            break;
+        case hash("data"):
+            hasData = true;
+            break;
+        }
+    }
+
+    if (name.empty())
+        return;
+
+    if (hasData && sampleData.empty()) {
+        DBG("The sample data provided for sample " << name
+            << " doesn't use base64 encoding, which is the only one sfizz knows how to decode.\n "
+            << "If it does, please use base64data= instead of data=."
+        );
+        return;
+    }
+
+    if (sampleData.empty())
+        return;
+
+    auto data = decodeBase64(sampleData);
+    FilePool& filePool = resources_.getFilePool();
+    FileId id { std::string(name) };
+    filePool.loadFromRam(id, data);
+}
+
+void Synth::Impl::resetDefaultCCValues() noexcept
+{
+    fill(absl::MakeSpan(defaultCCValues_), 0.0f);
+    setDefaultHdcc(7, normalizeCC(100));
+    setDefaultHdcc(10, 0.5f);
+    setDefaultHdcc(11, 1.0f);
+
+    setCCLabel(7, "Volume");
+    setCCLabel(10, "Pan");
+    setCCLabel(11, "Expression");
+}
+
+void Synth::Impl::prepareSfzLoad(const fs::path& path)
+{
+    auto newPath_ = path.string();
+    reloading = (lastPath_ == newPath_);
+
+    clear();
+
+#ifndef NDEBUG
+    if (reloading) {
+        DBG("[sfizz] Reloading the current file");
+    }
+#endif
+
+    if (!reloading) {
+
+        // Clear the background queues and clear the filePool
+        auto& filePool = resources_.getFilePool();
+        filePool.waitForBackgroundLoading();
+        filePool.clear();
+
+        // Set the default hdcc to their default
+        resetDefaultCCValues();
+
+        // Store the new path
+        lastPath_ = std::move(newPath_);
+    }
 }
 
 bool Synth::loadSfzFile(const fs::path& file)
 {
     Impl& impl = *impl_;
-
-    impl.clear();
+    impl.prepareSfzLoad(file);
 
     std::error_code ec;
     fs::path realFile = fs::canonical(file, ec);
-
     bool success = true;
     Parser& parser = impl.parser_;
     parser.parseFile(ec ? file : realFile);
@@ -536,7 +651,10 @@ bool Synth::loadSfzFile(const fs::path& file)
     success = success && !impl.layers_.empty();
 
     if (!success) {
+        DBG("[sfizz] Loading failed");
+        auto& filePool = impl.resources_.getFilePool();
         parser.clear();
+        filePool.clear();
         return false;
     }
 
@@ -547,8 +665,7 @@ bool Synth::loadSfzFile(const fs::path& file)
 bool Synth::loadSfzString(const fs::path& path, absl::string_view text)
 {
     Impl& impl = *impl_;
-
-    impl.clear();
+    impl.prepareSfzLoad(path);
 
     bool success = true;
     Parser& parser = impl.parser_;
@@ -561,7 +678,10 @@ bool Synth::loadSfzString(const fs::path& path, absl::string_view text)
     success = success && !impl.layers_.empty();
 
     if (!success) {
+        auto& filePool = impl.resources_.getFilePool();
+        DBG("[sfizz] Loading failed");
         parser.clear();
+        filePool.clear();
         return false;
     }
 
@@ -569,14 +689,21 @@ bool Synth::loadSfzString(const fs::path& path, absl::string_view text)
     return true;
 }
 
+void Synth::Impl::setCurrentSwitch(uint8_t noteValue)
+{
+    currentSwitch_ = noteValue + 12 * octaveOffset_ + noteOffset_;
+}
+
 void Synth::Impl::finalizeSfzLoad()
 {
-    const fs::path& rootDirectory = parser_.originalDirectory();
     FilePool& filePool = resources_.getFilePool();
+    WavetablePool& wavePool = resources_.getWavePool();
+
+    const fs::path& rootDirectory = parser_.originalDirectory();
     filePool.setRootDirectory(rootDirectory);
 
     // a string representation used for OSC purposes
-    rootPath_ = rootDirectory.u8string();
+    rootPath_ = u8EncodedString(rootDirectory);
 
     size_t currentRegionIndex = 0;
     size_t currentRegionCount = layers_.size();
@@ -607,9 +734,6 @@ void Synth::Impl::finalizeSfzLoad()
         Region& region = layer.getRegion();
 
         absl::optional<FileInformation> fileInformation;
-
-        FilePool& filePool = resources_.getFilePool();
-        WavetablePool& wavePool = resources_.getWavePool();
 
         if (!region.isGenerator()) {
             if (!filePool.checkSampleId(*region.sampleId)) {
@@ -724,7 +848,7 @@ void Synth::Impl::finalizeSfzLoad()
         // Defaults
         MidiState& midiState = resources_.getMidiState();
         for (int cc = 0; cc < config::numCCs; cc++) {
-            layer.registerCC(cc, midiState.getCCValue(cc), true);
+            layer.updateCCState(cc, midiState.getCCValue(cc));
         }
 
 
@@ -746,9 +870,10 @@ void Synth::Impl::finalizeSfzLoad()
             region.velCurve = Curve::buildFromVelcurvePoints(
                 region.velocityPoints, Curve::Interpolator::Linear);
 
-        layer.registerPitchWheel(0);
-        layer.registerAftertouch(0);
-        layer.registerTempo(2.0f);
+        layer.registerPitchWheel(midiState.getPitchBend());
+        layer.registerAftertouch(midiState.getChannelAftertouch());
+        layer.registerTempo(static_cast<float>(resources_.getBeatClock().getBeatsPerSecond()));
+        layer.registerProgramChange(midiState.getProgram());
         maxFilters = max(maxFilters, region.filters.size());
         maxEQs = max(maxEQs, region.equalizers.size());
         maxLFOs = max(maxLFOs, region.lfos.size());
@@ -758,14 +883,24 @@ void Synth::Impl::finalizeSfzLoad()
         haveAmplitudeLFO = haveAmplitudeLFO || region.amplitudeLFO != absl::nullopt;
         havePitchLFO = havePitchLFO || region.pitchLFO != absl::nullopt;
         haveFilterLFO = haveFilterLFO || region.filterLFO != absl::nullopt;
+        numOutputs_ = max(region.output + 1, numOutputs_);
 
         ++currentRegionIndex;
     }
 
-    for (const auto& toLoad: filesToLoad) {
-        filePool.preloadFile(toLoad.first, toLoad.second);
-    }
+    // Reset the preload call count to check for unused preloaded samples
+    // when reloading
+    if (reloading)
+        filePool.resetPreloadCallCounts();
 
+    for (const auto& toLoad: filesToLoad)
+        filePool.preloadFile(toLoad.first, toLoad.second);
+
+    // Remove preloaded data with no linked regions
+    if (reloading)
+        filePool.removeUnusedPreloadedData();
+
+    // Remove bad regions with unknown files
     if (currentRegionCount < layers_.size()) {
         DBG("Removing " << (layers_.size() - currentRegionCount)
             << " out of " << layers_.size() << " regions");
@@ -816,7 +951,7 @@ void Synth::Impl::finalizeSfzLoad()
     settingsPerVoice_.haveFilterLFO = haveFilterLFO;
 
     applySettingsPerVoice();
-
+    addEffectBusesIfNecessary(numOutputs_);
     setupModMatrix();
 
     // cache the set of used CCs for future access
@@ -906,6 +1041,12 @@ int Synth::getNumActiveVoices() const noexcept
         std::min(impl.numVoices_, activeVoices) : activeVoices;
 }
 
+std::vector<const Voice*> Synth::getActiveVoices() const noexcept
+{
+    Impl& impl = *impl_;
+    return impl.voiceManager_.getActiveVoices();
+}
+
 void Synth::setSamplesPerBlock(int samplesPerBlock) noexcept
 {
     Impl& impl = *impl_;
@@ -917,9 +1058,11 @@ void Synth::setSamplesPerBlock(int samplesPerBlock) noexcept
 
     impl.resources_.setSamplesPerBlock(samplesPerBlock);
 
-    for (auto& bus : impl.effectBuses_) {
-        if (bus)
-            bus->setSamplesPerBlock(samplesPerBlock);
+    for (int i = 0; i < impl.numOutputs_; ++i) {
+        for (auto& bus : impl.getEffectBusesForOutput(i)) {
+            if (bus)
+                bus->setSamplesPerBlock(samplesPerBlock);
+        }
     }
 }
 
@@ -939,9 +1082,11 @@ void Synth::setSampleRate(float sampleRate) noexcept
 
     impl.resources_.setSampleRate(sampleRate);
 
-    for (auto& bus : impl.effectBuses_) {
-        if (bus)
-            bus->setSampleRate(sampleRate);
+    for (int i = 0; i < impl.numOutputs_; ++i) {
+        for (auto& bus : impl.getEffectBusesForOutput(i)) {
+            if (bus)
+                bus->setSampleRate(sampleRate);
+        }
     }
 }
 
@@ -949,7 +1094,10 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
 {
     Impl& impl = *impl_;
     ScopedFTZ ftz;
-    CallbackBreakdown callbackBreakdown;
+    auto& callbackBreakdown = impl.callbackBreakdown_;
+    impl.resetCallbackBreakdown();
+    callbackBreakdown.dispatch = impl.dispatchDuration_;
+    impl.dispatchDuration_ = 0.0;
 
     { // Silence buffer
         ScopedTiming logger { callbackBreakdown.renderMethod };
@@ -969,7 +1117,7 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
     if (synthConfig.freeWheeling)
         filePool.waitForBackgroundLoading();
 
-    const auto now = std::chrono::high_resolution_clock::now();
+    const auto now = highResNow();
     const auto timeSinceLastCollection =
         std::chrono::duration_cast<std::chrono::seconds>(now - impl.lastGarbageCollection_);
 
@@ -1002,15 +1150,16 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
 
     { // Clear effect busses
         ScopedTiming logger { callbackBreakdown.effects };
-        for (auto& bus : impl.effectBuses_) {
-            if (bus)
-                bus->clearInputs(numFrames);
+        for (int i = 0; i < impl.numOutputs_; ++i) {
+            for (auto& bus : impl.getEffectBusesForOutput(i)) {
+                if (bus)
+                    bus->clearInputs(numFrames);
+            }
         }
     }
 
     { // Main render block
         ScopedTiming logger { callbackBreakdown.renderMethod, ScopedTiming::Operation::addToDuration };
-        tempMixSpan->fill(0.0f);
 
         for (auto& voice : impl.voiceManager_) {
             if (voice.isFree())
@@ -1020,10 +1169,11 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
 
             const Region* region = voice.getRegion();
             ASSERT(region != nullptr);
+            const auto& effectBuses = impl.getEffectBusesForOutput(region->output);
 
             voice.renderBlock(*tempSpan);
-            for (size_t i = 0, n = impl.effectBuses_.size(); i < n; ++i) {
-                if (auto& bus = impl.effectBuses_[i]) {
+            for (size_t i = 0, n = effectBuses.size(); i < n; ++i) {
+                if (auto& bus = effectBuses[i]) {
                     float addGain = region->getGainToEffectBus(i);
                     bus->addToInputs(*tempSpan, addGain, numFrames);
                 }
@@ -1045,19 +1195,26 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
         //    without any <effect>, the signal is just going to flow through it.
         ScopedTiming logger { callbackBreakdown.effects, ScopedTiming::Operation::addToDuration };
 
-        for (auto& bus : impl.effectBuses_) {
-            if (bus) {
-                bus->process(numFrames);
-                bus->mixOutputsTo(buffer, *tempMixSpan, numFrames);
+        const int numChannels = static_cast<int>(buffer.getNumChannels());
+        for (int i = 0; i < impl.numOutputs_; ++i) {
+            tempMixSpan->fill(0.0f);
+            const auto outputStart = numChannels == 0 ? 0 : (2 * i) % numChannels;
+            auto outputSpan = buffer.getStereoSpan(outputStart);
+            const auto& effectBuses = impl.getEffectBusesForOutput(i);
+            for (auto& bus : effectBuses) {
+                if (bus) {
+                    bus->process(numFrames);
+                    bus->mixOutputsTo(outputSpan, *tempMixSpan, numFrames);
+                }
             }
+
+            // Add the Mix output (fxNtomix opcodes)
+            // -- note(jpc) the purpose of the Mix output is not known.
+            //    perhaps it's designed as extension point for custom processing?
+            //    as default behavior, it adds itself to the Main signal.
+            outputSpan.add(*tempMixSpan);
         }
     }
-
-    // Add the Mix output (fxNtomix opcodes)
-    // -- note(jpc) the purpose of the Mix output is not known.
-    //    perhaps it's designed as extension point for custom processing?
-    //    as default behavior, it adds itself to the Main signal.
-    buffer.add(*tempMixSpan);
 
     // Apply the master volume
     buffer.applyGain(db2mag(impl.volume_));
@@ -1082,17 +1239,9 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
     impl.changedCCsThisCycle_.clear();
 
     { // Clear events and advance midi time
-        ScopedTiming logger { impl.dispatchDuration_, ScopedTiming::Operation::addToDuration };
+        ScopedTiming logger { impl.callbackBreakdown_.dispatch, ScopedTiming::Operation::addToDuration };
         midiState.advanceTime(buffer.getNumFrames());
     }
-
-    callbackBreakdown.dispatch = impl.dispatchDuration_;
-    Logger& logger = impl.resources_.getLogger();
-    logger.logCallbackTime(
-        callbackBreakdown, impl.voiceManager_.getNumActiveVoices(), numFrames);
-
-    // Reset the dispatch counter
-    impl.dispatchDuration_ = Duration(0);
 
     ASSERT(!hasNanInf(buffer.getConstSpan(0)));
     ASSERT(!hasNanInf(buffer.getConstSpan(1)));
@@ -1112,7 +1261,10 @@ void Synth::hdNoteOn(int delay, int noteNumber, float normalizedVelocity) noexce
     ASSERT(noteNumber >= 0);
     Impl& impl = *impl_;
     ScopedTiming logger { impl.dispatchDuration_, ScopedTiming::Operation::addToDuration };
-    impl.resources_.getMidiState().noteOnEvent(delay, noteNumber, normalizedVelocity);
+
+    if (impl.lastKeyswitchLists_[noteNumber].empty())
+        impl.resources_.getMidiState().noteOnEvent(delay, noteNumber, normalizedVelocity);
+
     impl.noteOnDispatch(delay, noteNumber, normalizedVelocity);
 }
 
@@ -1133,7 +1285,10 @@ void Synth::hdNoteOff(int delay, int noteNumber, float normalizedVelocity) noexc
     // way in sfz to specify that a release trigger should NOT use the note-on velocity?
     // auto replacedVelocity = (velocity == 0 ? getNoteVelocity(noteNumber) : velocity);
     MidiState& midiState = impl.resources_.getMidiState();
-    midiState.noteOffEvent(delay, noteNumber, normalizedVelocity);
+
+    if (impl.lastKeyswitchLists_[noteNumber].empty())
+        midiState.noteOffEvent(delay, noteNumber, normalizedVelocity);
+
     const auto replacedVelocity = midiState.getNoteVelocity(noteNumber);
 
     for (auto& voice : impl.voiceManager_)
@@ -1151,17 +1306,18 @@ void Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trigge
     if (selectedVoice == nullptr)
         return;
 
-    ASSERT(selectedVoice->isFree());
+    selectedVoice->reset();
     if (selectedVoice->startVoice(layer, delay, triggerEvent))
         ring.addVoiceToRing(selectedVoice);
 }
 
-void Synth::Impl::checkOffGroups(const Region* region, int delay, int number)
+void Synth::Impl::checkOffGroups(const Region* region, int delay, int number, bool chokedByCC)
 {
     for (auto& voice : voiceManager_) {
         if (voice.checkOffGroup(region, delay, number)) {
             const TriggerEvent& event = voice.getTriggerEvent();
-            noteOffDispatch(delay, event.number, event.value);
+            if (event.type == TriggerEventType::NoteOn && !chokedByCC)
+                noteOffDispatch(delay, event.number, event.value);
         }
     }
 }
@@ -1194,6 +1350,7 @@ void Synth::Impl::noteOnDispatch(int delay, int noteNumber, float velocity) noex
 {
     const auto randValue = randNoteDistribution_(Random::randomGenerator);
     SisterVoiceRingBuilder ring;
+    MidiState& midiState = resources_.getMidiState();
 
     if (!lastKeyswitchLists_[noteNumber].empty()) {
         if (currentSwitch_ && *currentSwitch_ != noteNumber) {
@@ -1215,6 +1372,9 @@ void Synth::Impl::noteOnDispatch(int delay, int noteNumber, float velocity) noex
     for (Layer* layer : noteActivationLists_[noteNumber]) {
         if (layer->registerNoteOn(noteNumber, velocity, randValue)) {
             const Region& region = layer->getRegion();
+            if (region.useTimerRange && !voiceManager_.withinValidTimerRange(&region, midiState.getInternalClock() + delay, sampleRate_))
+                continue;
+
             checkOffGroups(&region, delay, noteNumber);
             TriggerEvent triggerEvent { TriggerEventType::NoteOn, noteNumber, velocity };
             startVoice(layer, delay, triggerEvent, ring);
@@ -1266,10 +1426,12 @@ void Synth::cc(int delay, int ccNumber, int ccValue) noexcept
     hdcc(delay, ccNumber, normalizedCC);
 }
 
-void Synth::Impl::ccDispatch(int delay, int ccNumber, float value) noexcept
+void Synth::Impl::ccDispatch(int delay, int ccNumber, float value, int extendedArg) noexcept
 {
     SisterVoiceRingBuilder ring;
     TriggerEvent triggerEvent { TriggerEventType::CC, ccNumber, value };
+    const auto randValue = randNoteDistribution_(Random::randomGenerator);
+    MidiState& midiState = resources_.getMidiState();
     for (Layer* layer : ccActivationLists_[ccNumber]) {
         const Region& region = layer->getRegion();
 
@@ -1287,8 +1449,11 @@ void Synth::Impl::ccDispatch(int delay, int ccNumber, float value) noexcept
             }
         }
 
-        if (layer->registerCC(ccNumber, value)) {
-            checkOffGroups(&region, delay, ccNumber);
+        if (layer->registerCC(ccNumber, value, randValue, extendedArg)) {
+            if (region.useTimerRange && ! voiceManager_.withinValidTimerRange(&region, midiState.getInternalClock() + delay, sampleRate_))
+                continue;
+
+            checkOffGroups(&region, delay, ccNumber, true);
             startVoice(layer, delay, triggerEvent, ring);
         }
     }
@@ -1306,7 +1471,7 @@ void Synth::automateHdcc(int delay, int ccNumber, float normValue) noexcept
     impl.performHdcc(delay, ccNumber, normValue, false);
 }
 
-void Synth::Impl::performHdcc(int delay, int ccNumber, float normValue, bool asMidi) noexcept
+void Synth::Impl::performHdcc(int delay, int ccNumber, float normValue, bool asMidi, int extendedArg) noexcept
 {
     ASSERT(ccNumber < config::numCCs);
     ASSERT(ccNumber >= 0);
@@ -1334,7 +1499,7 @@ void Synth::Impl::performHdcc(int delay, int ccNumber, float normValue, bool asM
     for (auto& voice : voiceManager_)
         voice.registerCC(delay, ccNumber, normValue);
 
-    ccDispatch(delay, ccNumber, normValue);
+    ccDispatch(delay, ccNumber, normValue, extendedArg);
     midiState.ccEvent(delay, ccNumber, normValue);
 }
 
@@ -1343,7 +1508,6 @@ void Synth::Impl::setDefaultHdcc(int ccNumber, float value)
     ASSERT(ccNumber >= 0);
     ASSERT(ccNumber < config::numCCs);
     defaultCCValues_[ccNumber] = value;
-    resources_.getMidiState().ccEvent(0, ccNumber, value);
 }
 
 float Synth::getHdcc(int ccNumber)
@@ -1386,6 +1550,15 @@ void Synth::hdPitchWheel(int delay, float normalizedPitch) noexcept
     impl.performHdcc(delay, ExtendedCCs::pitchBend, normalizedPitch, false);
 }
 
+void Synth::programChange(int delay, int program) noexcept
+{
+    Impl& impl = *impl_;
+    impl.resources_.getMidiState().programChangeEvent(delay, program);
+    for (const Impl::LayerPtr& layer : impl.layers_)
+        layer->registerProgramChange(program);
+}
+
+
 void Synth::channelAftertouch(int delay, int aftertouch) noexcept
 {
     const float normalizedAftertouch = normalize7Bits(aftertouch);
@@ -1426,8 +1599,7 @@ void Synth::hdPolyAftertouch(int delay, int noteNumber, float normAftertouch) no
     for (auto& voice : impl.voiceManager_)
         voice.registerPolyAftertouch(delay, noteNumber, normAftertouch);
 
-    // Note information is lost on this CC
-    impl.performHdcc(delay, ExtendedCCs::polyphonicAftertouch, normAftertouch, false);
+    impl.performHdcc(delay, ExtendedCCs::polyphonicAftertouch, normAftertouch, false, noteNumber);
 }
 
 void Synth::tempo(int delay, float secondsPerBeat) noexcept
@@ -1619,10 +1791,10 @@ const Region* Synth::getRegionView(int idx) const noexcept
     return layer ? &layer->getRegion() : nullptr;
 }
 
-const EffectBus* Synth::getEffectBusView(int idx) const noexcept
+const EffectBus* Synth::getEffectBusView(int idx, int output) const noexcept
 {
     Impl& impl = *impl_;
-    return (size_t)idx < impl.effectBuses_.size() ? impl.effectBuses_[idx].get() : nullptr;
+    return (size_t)idx < impl.effectBuses_[output].size() ? impl.effectBuses_[output][idx].get() : nullptr;
 }
 
 const RegionSet* Synth::getRegionSetView(int idx) const noexcept
@@ -1712,6 +1884,7 @@ void Synth::setSampleQuality(ProcessMode mode, int quality)
         synthConfig.liveSampleQuality = quality;
         break;
     case ProcessFreewheeling:
+        // DBG("Set freewheeling quality" << quality);
         synthConfig.freeWheelingSampleQuality = quality;
         break;
     default:
@@ -1747,12 +1920,18 @@ void Synth::setOscillatorQuality(ProcessMode mode, int quality)
         synthConfig.liveOscillatorQuality = quality;
         break;
     case ProcessFreewheeling:
+        // DBG("Set freewheeling oscillator quality" << quality);
         synthConfig.freeWheelingOscillatorQuality = quality;
         break;
     default:
         SFIZZ_CHECK(false);
         break;
     }
+}
+
+void Synth::setSustainCancelsRelease(bool value)
+{
+    impl_->resources_.getSynthConfig().sustainCancelsRelease = value;
 }
 
 float Synth::getVolume() const noexcept
@@ -1799,6 +1978,11 @@ void Synth::Impl::resetVoices(int numVoices)
     }
 
     applySettingsPerVoice();
+}
+
+void Synth::Impl::resetCallbackBreakdown()
+{
+    callbackBreakdown_ = CallbackBreakdown();
 }
 
 void Synth::Impl::applySettingsPerVoice()
@@ -1949,7 +2133,7 @@ void Synth::Impl::resetAllControllers(int delay) noexcept
     for (const LayerPtr& layerPtr : layers_) {
         Layer& layer = *layerPtr;
         for (int cc = 0; cc < config::numCCs; ++cc)
-            layer.registerCC(cc, defaultCCValues_[cc], true);
+            layer.updateCCState(cc, defaultCCValues_[cc]);
     }
 }
 
@@ -1988,25 +2172,23 @@ bool Synth::shouldReloadScala()
     return impl.resources_.getTuning().shouldReloadScala();
 }
 
-void Synth::enableLogging(absl::string_view prefix) noexcept
+const Synth::CallbackBreakdown& Synth::getCallbackBreakdown() const noexcept
 {
     Impl& impl = *impl_;
-    impl.resources_.getLogger().enableLogging(prefix);
+    return impl.callbackBreakdown_;
 }
 
-void Synth::disableLogging() noexcept
-{
-    Impl& impl = *impl_;
-    impl.resources_.getLogger().disableLogging();
-}
 
 void Synth::allSoundOff() noexcept
 {
     Impl& impl = *impl_;
     for (auto& voice : impl.voiceManager_)
         voice.reset();
-    for (auto& effectBus : impl.effectBuses_)
-        effectBus->clear();
+    for (int i = 0; i < impl.numOutputs_; ++i) {
+        for (auto& effectBus : impl.getEffectBusesForOutput(i))
+            if (effectBus)
+                effectBus->clear();
+    }
 }
 
 void Synth::addExternalDefinition(const std::string& id, const std::string& value)
@@ -2048,6 +2230,11 @@ void Synth::Impl::collectUsedCCsFromRegion(BitArray<config::numCCs>& usedCCs, co
     collectUsedCCsFromCCMap(usedCCs, region.amplitudeEG.ccHold);
     collectUsedCCsFromCCMap(usedCCs, region.amplitudeEG.ccStart);
     collectUsedCCsFromCCMap(usedCCs, region.amplitudeEG.ccSustain);
+
+    collectUsedCCsFromCCMap(usedCCs, region.ampVeltrackCC);
+    collectUsedCCsFromCCMap(usedCCs, region.pitchVeltrackCC);
+    for (const auto& filter: region.filters)
+        collectUsedCCsFromCCMap(usedCCs, filter.veltrackCC);
 
     if (region.pitchEG) {
         collectUsedCCsFromCCMap(usedCCs, region.pitchEG->ccAttack);
@@ -2111,8 +2298,11 @@ void Synth::Impl::collectUsedCCsFromModulations(BitArray<config::numCCs>& usedCC
 BitArray<config::numCCs> Synth::Impl::collectAllUsedCCs()
 {
     BitArray<config::numCCs> used;
-    for (const LayerPtr& layerPtr : layers_)
+    for (const LayerPtr& layerPtr : layers_) {
         collectUsedCCsFromRegion(used, layerPtr->getRegion());
+        sustainOrSostenuto_.set(layerPtr->region_.sustainCC);
+        sustainOrSostenuto_.set(layerPtr->region_.sostenutoCC);
+    }
     collectUsedCCsFromModulations(used, resources_.getModMatrix());
     return used;
 }

@@ -6,6 +6,7 @@
 
 #include "Opcode.h"
 #include "LFODescription.h"
+#include "absl/strings/string_view.h"
 #include "utility/StringViewHelpers.h"
 #include "utility/Debug.h"
 #include <absl/strings/ascii.h>
@@ -271,11 +272,10 @@ absl::optional<uint8_t> readNoteValue(absl::string_view value)
     ///
     std::pair<absl::string_view, int> flatSharpPrefixes[] = {
         {   "#", +1 },
-        { u8"♯", +1 },
+        { (const char*)u8"♯", +1 },
         {   "b", -1 },
-        { u8"♭", -1 },
+        { (const char*)u8"♭", -1 },
     };
-
     for (const auto& prefix : flatSharpPrefixes) {
         if (absl::StartsWith(value, prefix.first)) {
             if (prefix.second == +1) {
@@ -303,6 +303,13 @@ absl::optional<uint8_t> readNoteValue(absl::string_view value)
 
     return static_cast<uint8_t>(noteNumber);
 }
+
+#if defined(__cpp_lib_char8_t)
+absl::optional<uint8_t> readNoteValue(std::u8string_view value)
+{
+    return readNoteValue(absl::string_view { reinterpret_cast<const char*>(value.data()), value.size() });
+}
+#endif
 
 absl::optional<bool> readBoolean(absl::string_view value)
 {
@@ -414,8 +421,8 @@ absl::optional<FilterType> Opcode::readOptional(OpcodeSpec<FilterType>, absl::st
     case hash("bpf_2p"): return kFilterBpf2p;
     case hash("brf_2p"): return kFilterBrf2p;
     case hash("bpf_1p"): return kFilterBpf1p;
-    case hash("brf_1p"): return kFilterBrf1p;
-    case hash("apf_1p"): return kFilterApf1p;
+    case hash("brf_1p"): return kFilterBrf2p; // Sforzando does this
+    // case hash("apf_1p"): return kFilterApf1p; // TODO: replace with the delay-less version later
     case hash("lpf_2p_sv"): return kFilterLpf2pSv;
     case hash("hpf_2p_sv"): return kFilterHpf2pSv;
     case hash("bpf_2p_sv"): return kFilterBpf2pSv;
@@ -432,7 +439,7 @@ absl::optional<FilterType> Opcode::readOptional(OpcodeSpec<FilterType>, absl::st
     case hash("peq"): return kFilterPeq;
     }
 
-    DBG("Unknown filter type: " << value);
+    DBG("Unknown/unsupported filter type: " << value);
     return absl::nullopt;
 }
 

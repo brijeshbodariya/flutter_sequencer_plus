@@ -210,23 +210,94 @@ inline CXX14_CONSTEXPR uint8_t offsetAndClampKey(uint8_t key, int offset)
     return clamp<uint8_t>(static_cast<uint8_t>(offsetKey), 0, 127);
 }
 
-namespace literals {
-    inline float operator""_norm(unsigned long long int value)
-    {
-        if (value > 127)
-            value = 127;
+enum ExtendedCCs {
+    pitchBend = 128,
+    channelAftertouch,
+    polyphonicAftertouch,
+    noteOnVelocity,
+    noteOffVelocity,
+    keyboardNoteNumber,
+    keyboardNoteGate,
+    unipolarRandom,
+    bipolarRandom,
+    alternate,
+    extendedCCupperBound
+};
 
-        return normalize7Bits(value);
+enum AriaExtendedCCs {
+    keydelta = 140,
+    absoluteKeydelta,
+    ariaCCupperBound
+};
+
+/**
+ * @brief Check if a CC is an ARIA-defined extended CC
+ *
+ * @param cc
+ * @return bool
+ */
+inline CXX14_CONSTEXPR bool isAriaExtendedCC(int cc) {
+    if (cc >= AriaExtendedCCs::keydelta && cc < AriaExtendedCCs::ariaCCupperBound)
+        return true;
+
+    return false;
+}
+
+/**
+ * @brief Check if a CC is an extended CC (ARIA or not)
+ *
+ * @param cc
+ * @return bool
+ */
+inline CXX14_CONSTEXPR bool isExtendedCC(int cc) {
+    if (isAriaExtendedCC(cc))
+        return true;
+
+    if (cc >= ExtendedCCs::pitchBend && cc < ExtendedCCs::extendedCCupperBound)
+        return true;
+
+    return false;
+}
+
+/**
+ * @brief Check if a CC applies per voice modulation
+ *
+ * @param cc
+ * @return bool
+ */
+inline CXX14_CONSTEXPR bool ccModulationIsPerVoice(int cc) {
+    switch (cc) {
+    case ExtendedCCs::noteOnVelocity: // fallthrough
+    case ExtendedCCs::noteOffVelocity: // fallthrough
+    case ExtendedCCs::keyboardNoteNumber: // fallthrough
+    case ExtendedCCs::keyboardNoteGate: // fallthrough
+    case ExtendedCCs::unipolarRandom: // fallthrough
+    case ExtendedCCs::bipolarRandom: // fallthrough
+    case ExtendedCCs::alternate:
+    case AriaExtendedCCs::keydelta:
+    case AriaExtendedCCs::absoluteKeydelta:
+        return true;
     }
 
-    inline float operator""_norm(long double value)
-    {
-        if (value < 0)
-            value = 0;
-        if (value > 127)
-            value = 127;
+    return false;
+}
 
-        return normalize7Bits(value);
+namespace literals {
+    inline float operator""_norm(unsigned long long int value) 
+    {
+        return static_cast<float>(value) / 127.0f; 
+    }
+    inline float operator""_norm(long double value) 
+    {
+        return static_cast<float>(value) / 127.0f; 
+    }
+    inline float operator""_bend(unsigned long long int value) 
+    {
+        return static_cast<float>(value) / 8191.0f; 
+    }
+    inline float operator""_bend(long double value) 
+    {
+        return static_cast<float>(value) / 8191.0f; 
     }
 }
 

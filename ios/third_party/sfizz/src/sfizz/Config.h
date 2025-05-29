@@ -18,19 +18,6 @@
 
 namespace sfz {
 
-enum ExtendedCCs {
-    pitchBend = 128,
-    channelAftertouch,
-    polyphonicAftertouch,
-    noteOnVelocity,
-    noteOffVelocity,
-    keyboardNoteNumber,
-    keyboardNoteGate,
-    unipolarRandom,
-    bipolarRandom,
-    alternate
-};
-
 namespace config {
     constexpr float defaultSampleRate { 48000 };
     constexpr float maxSampleRate { 192000 };
@@ -44,7 +31,7 @@ namespace config {
     constexpr int loggerQueueSize { 256 };
     constexpr int voiceLoggerQueueSize { 256 };
     constexpr bool loggingEnabled { false };
-    constexpr size_t numChannels { 2 };
+    constexpr size_t maxChannels { 32 };
     constexpr int numBackgroundThreads { 4 };
     constexpr unsigned fileClearingPeriod { 5 }; // in seconds
     constexpr int numVoices { 64 };
@@ -151,17 +138,12 @@ namespace config {
      */
     static constexpr float overflowVoiceMultiplier { 1.5f };
     static_assert(overflowVoiceMultiplier >= 1.0f, "This needs to add voices");
-
     /**
-     * @brief Calculate the effective voice number for the polyphony setting,
-     * accounting for the overflow factor.
+     * @brief Minimum number of overflow voices to add
+     *
      */
-    inline constexpr int calculateActualVoices(int polyphony)
-    {
-        return
-            (int(polyphony * config::overflowVoiceMultiplier) < int(config::maxVoices)) ?
-            int(polyphony * config::overflowVoiceMultiplier) : int(config::maxVoices);
-    }
+    static constexpr int minOverflowVoices { 4 };
+
     /**
      * @brief The smoothing time constant per "smooth" steps
      */

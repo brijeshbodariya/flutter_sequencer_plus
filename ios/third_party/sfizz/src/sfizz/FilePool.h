@@ -32,8 +32,8 @@
 #include "FileId.h"
 #include "FileMetadata.h"
 #include "SIMDHelpers.h"
-#include "Logger.h"
 #include "SpinMutex.h"
+#include "utility/Timing.h"
 #include "utility/LeakDetector.h"
 #include "utility/MemoryHelpers.h"
 #include <ghc/fs_std.hpp>
@@ -67,7 +67,7 @@ struct FileInformation {
 // Strict C++11 disallows member initialization if aggregate initialization is to be used...
 struct FileData
 {
-    enum class Status { Invalid, Preloaded, Streaming, Done };
+    enum class Status { Invalid, Preloaded, Streaming, Done, GarbageCollecting };
     FileData() = default;
     FileData(FileAudioBuffer preloaded, FileInformation info)
     : preloadedData(std::move(preloaded)), information(std::move(info))
@@ -76,7 +76,8 @@ struct FileData
     }
     AudioSpan<const float> getData()
     {
-        if (availableFrames > preloadedData.getNumFrames())
+        ASSERT(readerCount > 0);
+        if (status != Status::GarbageCollecting && availableFrames > preloadedData.getNumFrames())
             return AudioSpan<const float>(fileData).first(availableFrames);
         else
             return AudioSpan<const float>(preloadedData);
@@ -90,6 +91,7 @@ struct FileData
         information = std::move(other.information);
         preloadedData = std::move(other.preloadedData);
         fileData = std::move(other.fileData);
+        preloadCallCount = other.preloadCallCount;
         availableFrames = other.availableFrames.load();
         lastViewerLeftAt = other.lastViewerLeftAt;
         status = other.status.load();
@@ -100,6 +102,7 @@ struct FileData
         information = std::move(other.information);
         preloadedData = std::move(other.preloadedData);
         fileData = std::move(other.fileData);
+        preloadCallCount = other.preloadCallCount;
         availableFrames = other.availableFrames.load();
         lastViewerLeftAt = other.lastViewerLeftAt;
         status = other.status.load();
@@ -109,7 +112,9 @@ struct FileData
     FileAudioBuffer preloadedData;
     FileInformation information;
     FileAudioBuffer fileData {};
+    int preloadCallCount { 0 };
     std::atomic<Status> status { Status::Invalid };
+    bool fullyLoaded { false };
     std::atomic<size_t> availableFrames { 0 };
     std::atomic<int> readerCount { 0 };
     std::chrono::time_point<std::chrono::high_resolution_clock> lastViewerLeftAt;
@@ -147,7 +152,7 @@ public:
             return;
 
         data->readerCount -= 1;
-        data->lastViewerLeftAt = std::chrono::high_resolution_clock::now();
+        data->lastViewerLeftAt = highResNow();
         data = nullptr;
     }
     ~FileDataHolder()
@@ -191,7 +196,7 @@ public:
      * This creates the background threads based on config::numBackgroundThreads
      * as well as the garbage collection thread.
      */
-    FilePool(Logger& logger);
+    FilePool();
 
     ~FilePool();
     /**
@@ -205,7 +210,7 @@ public:
      *
      * @return size_t
      */
-    size_t getNumPreloadedSamples() const noexcept { return preloadedFiles.size(); }
+    size_t getNumPreloadedSamples() const noexcept { return preloadedFiles.size() + loadedFiles.size(); }
 
     /**
      * @brief Get metadata information about a file.
@@ -236,6 +241,16 @@ public:
     FileDataHolder loadFile(const FileId& fileId) noexcept;
 
     /**
+     * @brief Load a file from RAM and return its information. The file pool will store\
+     * this data for future requests so use this function responsibly.
+     *
+     * @param fileId
+     * @param data
+     * @return A handle on the file data
+     */
+    FileDataHolder loadFromRam(const FileId& fileId, const std::vector<char>& data) noexcept;
+
+    /**
      * @brief Check that the sample exists. If not, try to find it in a case insensitive way.
      *
      * @param filename the sample filename; may be updated by the method
@@ -258,6 +273,17 @@ public:
      *
      */
     void clear();
+
+    /**
+     * @brief Reset the number of preloadFile counts for each sample.
+     */
+    void resetPreloadCallCounts() noexcept;
+
+    /**
+     * @brief Clear all files with a preload call count of 0.
+     */
+    void removeUnusedPreloadedData() noexcept;
+
     /**
      * @brief Get a handle on a file, which triggers background loading
      *
@@ -313,7 +339,8 @@ public:
      */
     void triggerGarbageCollection() noexcept;
 private:
-    Logger& logger;
+
+    absl::optional<sfz::FileInformation> checkExistingFileInformation(const FileId& fileId) noexcept;
     fs::path rootDirectory;
 
     bool loadInRam { config::loadInRam };
@@ -328,13 +355,11 @@ private:
     // Structures for the background loaders
     struct QueuedFileData
     {
-        using TimePoint = std::chrono::time_point<std::chrono::high_resolution_clock>;
         QueuedFileData() noexcept {}
-        QueuedFileData(std::weak_ptr<FileId> id, FileData* data, TimePoint queuedTime) noexcept
-        : id(id), data(data), queuedTime(queuedTime) {}
+        QueuedFileData(std::weak_ptr<FileId> id, FileData* data) noexcept
+        : id(id), data(data) {}
         std::weak_ptr<FileId> id;
         FileData* data { nullptr };
-        TimePoint queuedTime {};
     };
 
     using FileQueue = atomic_queue::AtomicQueue2<QueuedFileData, config::maxVoices>;

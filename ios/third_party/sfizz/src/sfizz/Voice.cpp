@@ -33,6 +33,7 @@
 #include "BufferPool.h"
 #include "SynthConfig.h"
 #include "utility/Macros.h"
+#include "utility/Timing.h"
 #include <absl/algorithm/container.h>
 #include <absl/types/span.h>
 #include <random>
@@ -218,6 +219,7 @@ struct Voice::Impl
     const NumericId<Voice> id_;
     StateListener* stateListener_ = nullptr;
 
+    const Layer* layer_ { nullptr };
     const Region* region_ { nullptr };
 
     State state_ { State::idle };
@@ -260,6 +262,7 @@ struct Voice::Impl
 
     int samplesPerBlock_ { config::defaultSamplesPerBlock };
     float sampleRate_ { config::defaultSampleRate };
+    unsigned startTimestamp_ { 0 };
 
     Resources& resources_;
 
@@ -272,7 +275,7 @@ struct Voice::Impl
     std::unique_ptr<LFO> lfoPitch_;
     std::unique_ptr<LFO> lfoFilter_;
 
-    ADSREnvelope egAmplitude_ { resources_.getMidiState() };
+    ADSREnvelope egAmplitude_ { resources_.getMidiState(), resources_.getCurves() };
     std::unique_ptr<ADSREnvelope> egPitch_;
     std::unique_ptr<ADSREnvelope> egFilter_;
 
@@ -284,10 +287,10 @@ struct Voice::Impl
     float waveLeftGain_[config::oscillatorsPerVoice] {};
     float waveRightGain_[config::oscillatorsPerVoice] {};
 
-    Duration dataDuration_;
-    Duration amplitudeDuration_;
-    Duration panningDuration_;
-    Duration filterDuration_;
+    double dataDuration_;
+    double amplitudeDuration_;
+    double panningDuration_;
+    double filterDuration_;
 
     fast_real_distribution<float> uniformNoiseDist_ { -config::uniformNoiseBounds, config::uniformNoiseBounds };
     fast_gaussian_generator<float> gaussianNoiseDist_ { 0.0f, config::noiseVariance };
@@ -399,6 +402,7 @@ void Voice::Impl::updateExtendedCCValues() noexcept
     extendedCCValues_.bipolar = midiState.getCCValue(ExtendedCCs::bipolarRandom);
     extendedCCValues_.alternate = midiState.getCCValue(ExtendedCCs::alternate);
     extendedCCValues_.noteGate = midiState.getCCValue(ExtendedCCs::keyboardNoteGate);
+    extendedCCValues_.keydelta = midiState.getCCValue(AriaExtendedCCs::keydelta);
 }
 
 bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexcept
@@ -410,6 +414,7 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
     MidiState& midiState = resources.getMidiState();
     CurveSet& curveSet = resources.getCurves();
 
+    impl.layer_ = layer;
     const Region& region = layer->getRegion();
     impl.region_ = &region;
 
@@ -425,13 +430,17 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
         return false;
     }
 
-    impl.switchState(State::playing);
-
-    impl.updateExtendedCCValues();
-
     ASSERT(delay >= 0);
     if (delay < 0)
         delay = 0;
+
+    impl.triggerDelay_ = delay;
+    impl.initialDelay_ = delay + static_cast<int>(regionDelay(region, midiState) * impl.sampleRate_);
+    impl.startTimestamp_ = midiState.getInternalClock() + impl.initialDelay_; // need to set this before switchState
+
+    impl.switchState(State::playing);
+
+    impl.updateExtendedCCValues();
 
     if (region.isOscillator()) {
         WavetablePool& wavePool = resources.getWavePool();
@@ -506,8 +515,6 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
         impl.equalizers_[i].setup(region, i, impl.triggerEvent_.value);
     }
 
-    impl.triggerDelay_ = delay;
-    impl.initialDelay_ = delay + static_cast<int>(regionDelay(region, midiState) * impl.sampleRate_);
     impl.baseFrequency_ = tuning.getFrequencyOfKey(impl.triggerEvent_.number);
     impl.sampleEnd_ = int(sampleEnd(region, midiState));
     impl.sampleSize_ = impl.sampleEnd_- impl.sourcePosition_ - 1;
@@ -603,6 +610,7 @@ void Voice::Impl::off(int delay, bool fast) noexcept
         } else if (region_->offMode == OffMode::time) {
             egAmplitude_.setReleaseTime(region_->offTime);
         }
+        egAmplitude_.stopDynamicUpdates();
     }
     else {
         // TODO(jpc): Flex AmpEG
@@ -765,7 +773,7 @@ void Voice::setSamplesPerBlock(int samplesPerBlock) noexcept
     impl.powerFollower_.setSamplesPerBlock(samplesPerBlock);
 }
 
-void Voice::renderBlock(AudioSpan<float> buffer) noexcept
+void Voice::renderBlock(AudioSpan<float, 2> buffer) noexcept
 {
     Impl& impl = *impl_;
     ASSERT(static_cast<int>(buffer.getNumFrames()) <= impl.samplesPerBlock_);
@@ -972,6 +980,10 @@ void Voice::Impl::panStageMono(AudioSpan<float> buffer) noexcept
             (*modulationSpan)[i] += mod[i];
     }
     pan(*modulationSpan, leftBuffer, rightBuffer);
+
+    // add +3dB (10^(3/20)) to compensate for the pan stage (-3dB per stage)
+    applyGain1(1.4125375446227544f, leftBuffer);
+    applyGain1(1.4125375446227544f, rightBuffer);
 }
 
 void Voice::Impl::panStageStereo(AudioSpan<float> buffer) noexcept
@@ -1012,9 +1024,9 @@ void Voice::Impl::panStageStereo(AudioSpan<float> buffer) noexcept
     }
     pan(*modulationSpan, leftBuffer, rightBuffer);
 
-    // add +3dB to compensate for the 2 pan stages (-3dB each stage)
-    applyGain1(1.4125375446227544f, leftBuffer);
-    applyGain1(1.4125375446227544f, rightBuffer);
+    // add +6dB (10^(6/20)) to compensate for the 2 pan stages (-3dB per stage)
+    applyGain1(1.9952623149688797f, leftBuffer);
+    applyGain1(1.9952623149688797f, rightBuffer);
 }
 
 void Voice::Impl::filterStageMono(AudioSpan<float> buffer) noexcept
@@ -1064,6 +1076,10 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
     }
 
     auto source = currentPromise_->getData();
+    if (source.getNumFrames() == 0) {
+        DBG("[Voice] Empty source in promise");
+        return;
+    }
 
     BufferPool& bufferPool = resources_.getBufferPool();
     const CurveSet& curves = resources_.getCurves();
@@ -1172,7 +1188,7 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
         unsigned i = 0;
         while (i < numSamples) {
             int wrappedIndex = (*indices)[i] - loop.size * blockRestarts;
-            if (wrappedIndex > loop.end) {
+            while (wrappedIndex > loop.end) {
                 wrappedIndex -= loop.size;
                 blockRestarts += 1;
                 loop_.restarts += 1;
@@ -1662,17 +1678,18 @@ bool Voice::Impl::released() const noexcept
 bool Voice::checkOffGroup(const Region* other, int delay, int noteNumber) noexcept
 {
     Impl& impl = *impl_;
+    const Layer* layer = impl.layer_;
     const Region* region = impl.region_;
     if (region == nullptr || other == nullptr)
         return false;
 
-    if (impl.released())
+    if (impl.offed_)
         return false;
 
     if ((impl.triggerEvent_.type == TriggerEventType::NoteOn
             ||  impl.triggerEvent_.type == TriggerEventType::CC)
         && region->offBy && *region->offBy == other->group
-        && (region->group != other->group || noteNumber != impl.triggerEvent_.number)) {
+        && (region->group != other->group || !layer->ccSwitched_.all() || noteNumber != impl.triggerEvent_.number)) {
         off(delay);
         return true;
     }
@@ -1684,6 +1701,7 @@ void Voice::reset() noexcept
 {
     Impl& impl = *impl_;
     impl.switchState(State::idle);
+    impl.layer_ = nullptr;
     impl.region_ = nullptr;
     impl.currentPromise_.reset();
     impl.sourcePosition_ = 0;
@@ -1835,7 +1853,7 @@ void Voice::setPitchEGEnabledPerVoice(bool havePitchEG)
 {
     Impl& impl = *impl_;
     if (havePitchEG)
-        impl.egPitch_.reset(new ADSREnvelope(impl.resources_.getMidiState()));
+        impl.egPitch_.reset(new ADSREnvelope(impl.resources_.getMidiState(), impl.resources_.getCurves()));
     else
         impl.egPitch_.reset();
 }
@@ -1844,7 +1862,7 @@ void Voice::setFilterEGEnabledPerVoice(bool haveFilterEG)
 {
     Impl& impl = *impl_;
     if (haveFilterEG)
-        impl.egFilter_.reset(new ADSREnvelope(impl.resources_.getMidiState()));
+        impl.egFilter_.reset(new ADSREnvelope(impl.resources_.getMidiState(), impl.resources_.getCurves()));
     else
         impl.egFilter_.reset();
 }
@@ -2068,6 +2086,12 @@ int Voice::getSourcePosition() const noexcept
     return impl.sourcePosition_;
 }
 
+unsigned Voice::getStartTimestampSamples() const noexcept
+{
+    Impl& impl = *impl_;
+    return impl.startTimestamp_;
+}
+
 LFO* Voice::getLFO(size_t index)
 {
     Impl& impl = *impl_;
@@ -2086,25 +2110,25 @@ int Voice::getAge() const noexcept
     return impl.age_;
 }
 
-Duration Voice::getLastDataDuration() const noexcept
+double Voice::getLastDataDuration() const noexcept
 {
     Impl& impl = *impl_;
     return impl.dataDuration_;
 }
 
-Duration Voice::getLastAmplitudeDuration() const noexcept
+double Voice::getLastAmplitudeDuration() const noexcept
 {
     Impl& impl = *impl_;
     return impl.amplitudeDuration_;
 }
 
-Duration Voice::getLastFilterDuration() const noexcept
+double Voice::getLastFilterDuration() const noexcept
 {
     Impl& impl = *impl_;
     return impl.filterDuration_;
 }
 
-Duration Voice::getLastPanningDuration() const noexcept
+double Voice::getLastPanningDuration() const noexcept
 {
     Impl& impl = *impl_;
     return impl.panningDuration_;

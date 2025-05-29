@@ -135,6 +135,20 @@ public:
     float getPolyAftertouch(int noteNumber) const noexcept;
 
     /**
+     * @brief Get the current midi program
+     *
+     * @return int
+     */
+    int getProgram() const noexcept;
+    /**
+     * @brief Register a program change event
+     *
+     * @param delay
+     * @param program
+     */
+    void programChangeEvent(int delay, int program) noexcept;
+
+    /**
      * @brief Register a CC event
      *
      * @param ccNumber
@@ -150,6 +164,12 @@ public:
      * @param numSamples the number of samples of clock advance
      */
     void advanceTime(int numSamples) noexcept;
+
+    /**
+     * @brief Returns current internal sample clock
+     *
+     */
+    unsigned getInternalClock() const noexcept { return internalClock; }
 
     /**
      * @brief Flush events in all states, keeping only the last one as the "base" state
@@ -184,15 +204,20 @@ public:
     float getCCValueAt(int ccNumber, int delay) const noexcept;
 
     /**
-     * @brief Reset the midi state (does not impact the last note on time)
+     * @brief Reset the midi note states
      *
      */
-    void reset() noexcept;
+    void resetNoteStates() noexcept;
 
     const EventVector& getCCEvents(int ccIdx) const noexcept;
     const EventVector& getPolyAftertouchEvents(int noteNumber) const noexcept;
     const EventVector& getPitchEvents() const noexcept;
     const EventVector& getChannelAftertouchEvents() const noexcept;
+    /**
+     * @brief Reset the midi event states (CC, AT, and pitch bend)
+     *
+     */
+    void resetEventStates() noexcept;
 
 private:
 
@@ -241,7 +266,7 @@ private:
     /**
      * @brief Last note played
      */
-    int lastNotePlayed { 0 };
+    int lastNotePlayed { -1 };
 
     /**
      * @brief Current known values for the CCs.
@@ -269,6 +294,11 @@ private:
      * @brief Polyphonic aftertouch status.
      */
     std::array<EventVector, 128> polyAftertouchEvents;
+
+    /**
+     * @brief Current midi program
+     */
+    int currentProgram { 0 };
 
     float sampleRate { config::defaultSampleRate };
     int samplesPerBlock { config::defaultSamplesPerBlock };

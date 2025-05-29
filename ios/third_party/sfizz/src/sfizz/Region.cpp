@@ -5,6 +5,7 @@
 // If not, contact the sfizz maintainers at https://github.com/sfztools/sfizz
 
 #include "Region.h"
+#include "Defaults.h"
 #include "Opcode.h"
 #include "MathHelpers.h"
 #include "utility/SwapAndPop.h"
@@ -182,6 +183,9 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
     case hash("group"): // also polyphony_group
         group = opcode.read(Default::group);
         break;
+    case hash("output"):
+        output = opcode.read(Default::output);
+        break;
     case hash("off_by"): // also offby
         offBy = opcode.readOptional(Default::group);
         break;
@@ -206,12 +210,7 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
         break;
     // Region logic: key mapping
     case hash("lokey"):
-        {
-            absl::optional<uint8_t> optValue = opcode.readOptional(Default::loKey);
-            triggerOnNote = optValue != absl::nullopt;
-            uint8_t value = optValue.value_or(Default::loKey);
-            keyRange.setStart(value);
-        }
+        keyRange.setStart(opcode.read(Default::loKey));
         break;
     case hash("hikey"):
         {
@@ -244,6 +243,12 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
         break;
     case hash("hibend"):
         bendRange.setEnd(opcode.read(Default::hiBend));
+        break;
+    case hash("loprog"):
+        programRange.setStart(opcode.read(Default::loProgram));
+        break;
+    case hash("hiprog"):
+        programRange.setEnd(opcode.read(Default::hiProgram));
         break;
     case hash("locc&"):
         if (opcode.parameters.back() >= config::numCCs)
@@ -556,6 +561,15 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
         break;
     case hash("group_volume"):
         groupVolume = opcode.read(Default::volume);
+        break;
+
+    case hash("lotimer"):
+        timerRange.setStart(opcode.read(Default::loTimer));
+        useTimerRange = useTimerRange || timerRange.getStart() != Default::loTimer;
+        break;
+    case hash("hitimer"):
+        timerRange.setEnd(opcode.read(Default::hiTimer));
+        useTimerRange = useTimerRange || timerRange.getEnd() != Default::hiTimer;
         break;
 
     // Performance parameters: filters
@@ -1046,12 +1060,30 @@ bool sfz::Region::parseLFOOpcode(const Opcode& opcode, absl::optional<LFODescrip
     return parsed;
 }
 
+template<class Member, class T, class U>
+bool parseEGModifierCurveHelper(const sfz::Opcode& opcode, sfz::CCMap<sfz::ModifierCurvePair<T>>& ccMap, sfz::OpcodeSpec<U> spec, Member member)
+{
+    if (opcode.parameters.back() >= sfz::config::numCCs)
+        return false;
+
+    ccMap[opcode.parameters.back()].*member = opcode.read(spec);
+    return true;
+}
+
 bool sfz::Region::parseEGOpcode(const Opcode& opcode, EGDescription& eg)
 {
     #define case_any_eg(param)                      \
         case hash("ampeg_" param):                  \
         case hash("pitcheg_" param):                \
         case hash("fileg_" param)                   \
+
+    auto setModifier = [&opcode] (auto& ccMap, auto& spec) -> bool {
+        return parseEGModifierCurveHelper(opcode, ccMap, spec, &ModifierCurvePair<float>::modifier);
+    };
+
+    auto setCurve = [&opcode] (auto& ccMap) -> bool {
+        return parseEGModifierCurveHelper(opcode, ccMap, Default::curveCC, &ModifierCurvePair<float>::curve);
+    };
 
     switch (opcode.lettersOnlyHash) {
     case_any_eg("attack"):
@@ -1094,53 +1126,60 @@ bool sfz::Region::parseEGOpcode(const Opcode& opcode, EGDescription& eg)
         eg.vel2sustain = opcode.read(Default::egPercentMod);
         break;
     case_any_eg("attack_oncc&"): // also attackcc&
-        if (opcode.parameters.back() >= config::numCCs)
+        if (!setModifier(eg.ccAttack, Default::egTimeMod))
             return false;
-
-        eg.ccAttack[opcode.parameters.back()] = opcode.read(Default::egTimeMod);
-
+        break;
+    case_any_eg("attack_curvecc&"):
+        if (!setCurve(eg.ccAttack))
+            return false;
         break;
     case_any_eg("decay_oncc&"): // also decaycc&
-        if (opcode.parameters.back() >= config::numCCs)
+        if (!setModifier(eg.ccDecay, Default::egTimeMod))
             return false;
-
-        eg.ccDecay[opcode.parameters.back()] = opcode.read(Default::egTimeMod);
-
+        break;
+    case_any_eg("decay_curvecc&"):
+        if (!setCurve(eg.ccDecay))
+            return false;
         break;
     case_any_eg("delay_oncc&"): // also delaycc&
-        if (opcode.parameters.back() >= config::numCCs)
+        if (!setModifier(eg.ccDelay, Default::egTimeMod))
             return false;
-
-        eg.ccDelay[opcode.parameters.back()] = opcode.read(Default::egTimeMod);
-
+        break;
+    case_any_eg("delay_curvecc&"):
+        if (!setCurve(eg.ccDelay))
+            return false;
         break;
     case_any_eg("hold_oncc&"): // also holdcc&
-        if (opcode.parameters.back() >= config::numCCs)
+        if (!setModifier(eg.ccHold, Default::egTimeMod))
             return false;
-
-        eg.ccHold[opcode.parameters.back()] = opcode.read(Default::egTimeMod);
-
+        break;
+    case_any_eg("hold_curvecc&"): // also attackcc&
+        if (!setCurve(eg.ccHold))
+            return false;
         break;
     case_any_eg("release_oncc&"): // also releasecc&
-        if (opcode.parameters.back() >= config::numCCs)
+        if (!setModifier(eg.ccRelease, Default::egTimeMod))
             return false;
-
-        eg.ccRelease[opcode.parameters.back()] = opcode.read(Default::egTimeMod);
-
+        break;
+    case_any_eg("release_curvecc&"): // also attackcc&
+        if (!setCurve(eg.ccRelease))
+            return false;
         break;
     case_any_eg("start_oncc&"): // also startcc&
-        if (opcode.parameters.back() >= config::numCCs)
+        if (!setModifier(eg.ccStart, Default::egPercentMod))
             return false;
-
-        eg.ccStart[opcode.parameters.back()] = opcode.read(Default::egPercentMod);
-
+        break;
+    case_any_eg("start_curvecc&"): // also startcc&
+        if (!setCurve(eg.ccStart))
+            return false;
         break;
     case_any_eg("sustain_oncc&"): // also sustaincc&
-        if (opcode.parameters.back() >= config::numCCs)
+        if (!setModifier(eg.ccSustain, Default::egPercentMod))
             return false;
-
-        eg.ccSustain[opcode.parameters.back()] = opcode.read(Default::egPercentMod);
-
+        break;
+    case_any_eg("sustain_curvecc&"): // also attackcc&
+        if (!setCurve(eg.ccSustain))
+            return false;
         break;
 
     case_any_eg("dynamic"):
@@ -1653,6 +1692,19 @@ bool sfz::Region::parseEGOpcodeV2(const Opcode& opcode)
         break;
     }
 
+    case hash("eg&_freq_lfo&"):
+        if (lfos.size() < opcode.parameters[1] - 1)
+            return false;
+        EG_target(ModKey::createNXYZ(ModId::LFOFrequency, id, opcode.parameters[1] - 1), Default::lfoFreqMod);
+        break;
+
+    case_any_ccN("eg&_freq_lfo&"):
+        if (lfos.size() < opcode.parameters[1] - 1)
+            return false;
+        EG_target_cc(ModKey::createNXYZ(ModId::LFOFrequency, id, opcode.parameters[1] - 1), Default::lfoFreqMod);
+        break;
+
+
     default:
         return false;
     }
@@ -1673,8 +1725,13 @@ bool sfz::Region::processGenericCc(const Opcode& opcode, OpcodeSpec<float> spec,
         // search an existing connection of same CC number and target
         // if it exists, modify, otherwise create
         auto it = std::find_if(connections.begin(), connections.end(),
-            [ccNumber, &target](const Connection& x) -> bool
+            [ccNumber, &target, this](const Connection& x) -> bool
             {
+                if (ccModulationIsPerVoice(ccNumber))
+                    return x.source.id() == ModId::PerVoiceController &&
+                        x.source.region() == id &&
+                        x.source.parameters().cc == ccNumber &&
+                        x.target == target;
                 return x.source.id() == ModId::Controller &&
                     x.source.parameters().cc == ccNumber &&
                     x.target == target;
@@ -1700,10 +1757,7 @@ bool sfz::Region::processGenericCc(const Opcode& opcode, OpcodeSpec<float> spec,
                 p.curve = opcode.read(Default::curveCC);
             break;
         case kOpcodeStepCcN:
-            {
-                const OpcodeSpec<float> stepCC { 0.0f, {}, kPermissiveBounds };
-                p.step = spec.normalizeInput(opcode.read(stepCC));
-            }
+                p.step = spec.normalizeInput(opcode.read(Default::stepCC));
             break;
         case kOpcodeSmoothCcN:
             p.smooth = opcode.read(Default::smoothCC);
@@ -1713,20 +1767,11 @@ bool sfz::Region::processGenericCc(const Opcode& opcode, OpcodeSpec<float> spec,
             break;
         }
 
-        switch (p.cc) {
-        case ExtendedCCs::noteOnVelocity: // fallthrough
-        case ExtendedCCs::noteOffVelocity: // fallthrough
-        case ExtendedCCs::keyboardNoteNumber: // fallthrough
-        case ExtendedCCs::keyboardNoteGate: // fallthrough
-        case ExtendedCCs::unipolarRandom: // fallthrough
-        case ExtendedCCs::bipolarRandom: // fallthrough
-        case ExtendedCCs::alternate:
+       if (ccModulationIsPerVoice(p.cc)) {
             conn->source = ModKey(ModId::PerVoiceController, id, p);
-            break;
-        default:
+       } else {
             conn->source = ModKey(ModId::Controller, {}, p);
-            break;
-        }
+       }
     }
 
     return true;
@@ -1831,11 +1876,21 @@ sfz::Region::Connection& sfz::Region::getOrCreateConnection(const ModKey& source
 
 sfz::Region::Connection* sfz::Region::getConnectionFromCC(int sourceCC, const ModKey& target)
 {
-    for (sfz::Region::Connection& conn : connections) {
-        if (conn.source.id() == sfz::ModId::Controller && conn.target == target) {
-            auto p = conn.source.parameters();
-            if (p.cc == sourceCC)
-                return &conn;
+    if (ccModulationIsPerVoice(sourceCC)) {
+        for (sfz::Region::Connection& conn : connections) {
+            if (conn.source.id() == sfz::ModId::PerVoiceController && conn.target == target && conn.source.region() == id) {
+                const auto& p = conn.source.parameters();
+                if (p.cc == sourceCC)
+                    return &conn;
+            }
+        }
+    } else {
+        for (sfz::Region::Connection& conn : connections) {
+            if (conn.source.id() == sfz::ModId::Controller && conn.target == target) {
+                const auto& p = conn.source.parameters();
+                if (p.cc == sourceCC)
+                    return &conn;
+            }
         }
     }
     return nullptr;

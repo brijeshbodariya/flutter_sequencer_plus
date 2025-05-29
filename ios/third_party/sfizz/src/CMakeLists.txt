@@ -1,5 +1,3 @@
-include(GNUInstallDirs)
-
 set(FAUST_FILES
     sfizz/dsp/filters/filters_modulable.dsp
     sfizz/dsp/filters/rbj_filters.dsp
@@ -12,6 +10,11 @@ set(FAUST_FILES
     sfizz/effects/dsp/disto_stage.dsp
     sfizz/effects/dsp/fverb.dsp)
 source_group("Faust Files" FILES ${FAUST_FILES})
+
+# Generate Config.h
+# Currently required only to customize the MIDI_CC_COUNT
+configure_file("${PROJECT_SOURCE_DIR}/src/Config.h.in"
+    "${PROJECT_SOURCE_DIR}/src/sfizz/Config.h" @ONLY)
 
 set(SFIZZ_HEADERS
     sfizz/ADSREnvelope.h
@@ -31,6 +34,7 @@ set(SFIZZ_HEADERS
     sfizz/utility/NumericId.h
     sfizz/utility/StringViewHelpers.h
     sfizz/utility/SwapAndPop.h
+    sfizz/utility/Timing.h
     sfizz/utility/XmlHelpers.h
     sfizz/modulations/ModId.h
     sfizz/modulations/ModKey.h
@@ -78,7 +82,6 @@ set(SFIZZ_HEADERS
     sfizz/Interpolators.h
     sfizz/Interpolators.hpp
     sfizz/Layer.h
-    sfizz/Logger.h
     sfizz/LFO.h
     sfizz/LFOCommon.h
     sfizz/LFOCommon.hpp
@@ -139,7 +142,6 @@ set(SFIZZ_SOURCES
     sfizz/MidiState.cpp
     sfizz/Oversampler.cpp
     sfizz/ADSREnvelope.cpp
-    sfizz/Logger.cpp
     sfizz/SfzFilter.cpp
     sfizz/Curve.cpp
     sfizz/Smoothers.cpp
@@ -193,7 +195,8 @@ set(SFIZZ_SOURCES
     sfizz/effects/impl/ResonantStringAVX.cpp
     sfizz/effects/impl/ResonantArray.cpp
     sfizz/effects/impl/ResonantArraySSE.cpp
-    sfizz/effects/impl/ResonantArrayAVX.cpp)
+    sfizz/effects/impl/ResonantArrayAVX.cpp
+    sfizz/utility/c++17/AlignedMemorySupport.cpp)
 
 include(SfizzSIMDSourceFiles)
 sfizz_add_simd_sources(SFIZZ_SOURCES ".")
@@ -228,9 +231,7 @@ target_include_directories(sfizz_parser PUBLIC sfizz)
 target_link_libraries(sfizz_parser
     PUBLIC sfizz::filesystem sfizz::simde absl::strings
     PRIVATE absl::flat_hash_map)
-if(SFIZZ_RELEASE_ASSERTS)
-    target_compile_definitions(sfizz_parser PUBLIC "SFIZZ_ENABLE_RELEASE_ASSERT=1")
-endif()
+sfizz_enable_release_asserts(sfizz_parser)
 
 # OSC messaging library
 set(SFIZZ_MESSAGING_HEADERS
@@ -247,9 +248,8 @@ target_sources(sfizz_messaging PRIVATE
     ${SFIZZ_MESSAGING_HEADERS} ${SFIZZ_MESSAGING_SOURCES})
 target_include_directories(sfizz_messaging PUBLIC ".")
 target_link_libraries(sfizz_messaging PUBLIC absl::strings)
-if(SFIZZ_RELEASE_ASSERTS)
-    target_compile_definitions(sfizz_messaging PUBLIC "SFIZZ_ENABLE_RELEASE_ASSERT=1")
-endif()
+sfizz_enable_release_asserts(sfizz_messaging)
+
 
 # Import library
 set(SFIZZ_IMPORT_HEADERS
@@ -295,23 +295,17 @@ target_sources(sfizz_internal PRIVATE ${SFIZZ_HEADERS} ${SFIZZ_SOURCES} ${FAUST_
 target_include_directories(sfizz_internal PUBLIC "." "sfizz")
 target_link_libraries(sfizz_internal
     PUBLIC absl::strings absl::span sfizz::filesystem sfizz::atomic_queue sfizz::spin_mutex sfizz::bit_array sfizz::simde sfizz::hiir sfizz::jsl
-    PRIVATE sfizz::parser sfizz::messaging absl::flat_hash_map Threads::Threads st_audiofile sfizz::pugixml sfizz::spline sfizz::tunings sfizz::kissfft sfizz::cephes sfizz::cpuid sfizz::threadpool sfizz::atomic)
+    PRIVATE sfizz::parser sfizz::messaging absl::flat_hash_map Threads::Threads st_audiofile sfizz::pugixml sfizz::spline sfizz::tunings sfizz::kissfft sfizz::cephes sfizz::cpuid sfizz::threadpool sfizz::atomic invoke_hpp)
 if(SFIZZ_USE_SNDFILE)
     target_compile_definitions(sfizz_internal PUBLIC "SFIZZ_USE_SNDFILE=1")
     target_link_libraries(sfizz_internal PUBLIC st_audiofile)
 endif()
-if(SFIZZ_RELEASE_ASSERTS)
-    target_compile_definitions(sfizz_internal PUBLIC "SFIZZ_ENABLE_RELEASE_ASSERT=1")
+sfizz_enable_release_asserts(sfizz_internal)
+
+if(SFIZZ_IMPLEMENT_CXX17_ALIGNED_NEW_SUPPORT)
+    target_compile_definitions(sfizz_internal PRIVATE "SFIZZ_IMPLEMENT_CXX17_ALIGNED_NEW_SUPPORT=1")
 endif()
 sfizz_enable_fast_math(sfizz_internal)
-
-# Check that sfizz and cmake-side definitions are matching
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/sfizz_match_definitions.cpp" "
-#include \"Config.h\"
-static_assert(sfz::config::numCCs == ${SFIZZ_NUM_CCS}, \"SFIZZ_NUM_CCS did not match\");
-")
-add_library(sfizz_match_definitions STATIC "${CMAKE_CURRENT_BINARY_DIR}/sfizz_match_definitions.cpp")
-target_link_libraries(sfizz_match_definitions PRIVATE sfizz::internal)
 
 # Sfizz static library
 add_library(sfizz_static STATIC sfizz/sfizz_wrapper.cpp sfizz/sfizz.cpp sfizz/sfizz_private.hpp)
@@ -332,7 +326,12 @@ if(SFIZZ_SHARED)
     target_include_directories(sfizz_shared PUBLIC .)
     target_link_libraries(sfizz_shared PRIVATE sfizz::internal)
     target_compile_definitions(sfizz_shared PRIVATE SFIZZ_EXPORT_SYMBOLS)
-    set_target_properties(sfizz_shared PROPERTIES VERSION "${PROJECT_VERSION}" SOVERSION "${PROJECT_VERSION_MAJOR}" OUTPUT_NAME "sfizz" PUBLIC_HEADER "sfizz.h;sfizz.hpp;sfizz_message.h")
+    set_target_properties(sfizz_shared PROPERTIES
+        VERSION "${PROJECT_VERSION}"
+        SOVERSION "${PROJECT_VERSION_MAJOR}"
+        OUTPUT_NAME "sfizz"
+        PUBLIC_HEADER "sfizz.h;sfizz.hpp;sfizz_message.h"
+    )
     sfizz_enable_lto_if_needed(sfizz_shared)
 
     if(NOT MSVC)
@@ -345,10 +344,13 @@ if(SFIZZ_SHARED)
         if(SFIZZ_USE_SNDFILE)
             set(SFIZZ_PC_REQUIRES "${SFIZZ_PC_REQUIRES} sndfile")
         endif()
-        configure_file(${PROJECT_SOURCE_DIR}/scripts/sfizz.pc.in sfizz.pc @ONLY)
-        install(FILES ${CMAKE_BINARY_DIR}/src/sfizz.pc
+        configure_file(${PROJECT_SOURCE_DIR}/scripts/sfizz.pc.in
+            ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/pkgconfig/sfizz.pc @ONLY
+        )
+        install(FILES ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/pkgconfig/sfizz.pc
             DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
-            COMPONENT "development")
+            COMPONENT "development"
+        )
     endif()
 endif()
 
@@ -435,12 +437,6 @@ target_sources(sfizz_internal PRIVATE
     "sfizz/effects/gen/fverb.hxx"
     "sfizz/effects/gen/gate.hxx"
     "sfizz/effects/gen/limiter.hxx")
-
-# Windows installer
-if(WIN32)
-    include(VSTConfig)
-    configure_file(${PROJECT_SOURCE_DIR}/scripts/innosetup.iss.in ${PROJECT_BINARY_DIR}/innosetup.iss @ONLY)
-endif()
 
 # Doxygen
 configure_file(${PROJECT_SOURCE_DIR}/scripts/doxygen/Doxyfile.in ${PROJECT_SOURCE_DIR}/Doxyfile @ONLY)

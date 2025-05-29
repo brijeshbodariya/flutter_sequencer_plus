@@ -126,6 +126,51 @@ struct OpcodeSpec
     }
 
     operator T() const { return normalizeInput(defaultInputValue); }
+
+
+    /**
+     * @brief Demormalizes an input as needed for the spec
+     *
+     * @tparam U
+     * @param input
+     * @return U
+     */
+    template<class U=T>
+    typename std::enable_if<IsNormalizable<U>::value, U>::type denormalizeInput(U input) const
+    {
+        constexpr int needsOperation {
+            kNormalizePercent |
+            kNormalizeMidi |
+            kNormalizeBend |
+            kDb2Mag
+        };
+
+        if (!(flags & needsOperation))
+            return input;
+        else if (flags & kNormalizePercent)
+            return static_cast<U>(input * U(100));
+        else if (flags & kNormalizeMidi)
+            return static_cast<U>(std::trunc(input * U(127)));
+        else if (flags & kNormalizeBend)
+            return static_cast<U>(input * U(8191));
+        else if (flags & kDb2Mag)
+            return static_cast<U>(mag2db(input));
+
+        return input;
+    }
+
+    /**
+     * @brief Normalizes an input as needed for the spec
+     *
+     * @tparam U
+     * @param input
+     * @return U
+     */
+    template<class U=T>
+    typename std::enable_if<!IsNormalizable<U>::value, U>::type denormalizeInput(U input) const
+    {
+        return input;
+    }
 };
 
 namespace Default
@@ -154,6 +199,7 @@ namespace Default
     extern const OpcodeSpec<float> oscillatorModDepthMod;
     extern const OpcodeSpec<int32_t> oscillatorQuality;
     extern const OpcodeSpec<int64_t> group;
+    extern const OpcodeSpec<uint16_t> output;
     extern const OpcodeSpec<float> offTime;
     extern const OpcodeSpec<uint32_t> polyphony;
     extern const OpcodeSpec<uint32_t> notePolyphony;
@@ -170,6 +216,8 @@ namespace Default
     extern const OpcodeSpec<float> xfinLo;
     extern const OpcodeSpec<float> loBend;
     extern const OpcodeSpec<float> hiBend;
+    extern const OpcodeSpec<uint8_t> loProgram;
+    extern const OpcodeSpec<uint8_t> hiProgram;
     extern const OpcodeSpec<float> loNormalized;
     extern const OpcodeSpec<float> hiNormalized;
     extern const OpcodeSpec<float> loBipolar;
@@ -180,6 +228,7 @@ namespace Default
     extern const OpcodeSpec<float> hiPolyAftertouch;
     extern const OpcodeSpec<uint16_t> ccNumber;
     extern const OpcodeSpec<uint8_t> curveCC;
+    extern const OpcodeSpec<float> stepCC;
     extern const OpcodeSpec<uint16_t> smoothCC;
     extern const OpcodeSpec<uint8_t> sustainCC;
     extern const OpcodeSpec<uint8_t> sostenutoCC;
@@ -273,6 +322,8 @@ namespace Default
     extern const OpcodeSpec<float> flexEGPointLevelMod;
     extern const OpcodeSpec<float> flexEGPointShape;
     extern const OpcodeSpec<int32_t> sampleQuality;
+    extern const OpcodeSpec<int32_t> freewheelingSampleQuality;
+    extern const OpcodeSpec<int32_t> freewheelingOscillatorQuality;
     extern const OpcodeSpec<int32_t> octaveOffset;
     extern const OpcodeSpec<int32_t> noteOffset;
     extern const OpcodeSpec<float> effect;
@@ -312,6 +363,9 @@ namespace Default
     extern const OpcodeSpec<FilterType> filter;
     extern const OpcodeSpec<EqType> eq;
     extern const OpcodeSpec<bool> sustainCancelsRelease;
+    extern const OpcodeSpec<float> loTimer;
+    extern const OpcodeSpec<float> hiTimer;
+    extern const OpcodeSpec<bool> ramBased;
 
     // Default/max count for objects
     constexpr int numEQs { 3 };
@@ -334,8 +388,6 @@ namespace Default
 
     // Various defaut values
     // e.g. "additional" or multiple defautl values
-    constexpr int freewheelingSampleQuality { 10 };
-    constexpr int freewheelingOscillatorQuality { 3 };
     constexpr float globalVolume { -7.35f };
     constexpr float defaultEQFreq [numEQs] { 50.0f, 500.0f, 5000.0f };
 } // namespace Default

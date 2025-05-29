@@ -14,12 +14,13 @@ namespace sfz {
  * @brief Describe an attack/delay/sustain/release envelope that can
  * produce its coefficient in a blockwise manner for SIMD-type operations.
  */
+
 class ADSREnvelope {
 public:
     using Float = float;
 
-    ADSREnvelope(const MidiState& state)
-    : midiState_(state) {}
+    ADSREnvelope(const MidiState& state, CurveSet& curveSet)
+    : midiState_(state), curveSet_(curveSet) {}
     /**
      * @brief Resets the ADSR envelope given a Region, the current midi state, and a delay and
      * trigger velocity
@@ -76,6 +77,12 @@ public:
      */
     int getRemainingDelay() const noexcept { return delay; }
 
+    /**
+     * @brief Stop dynamic updates of the EG values.
+     *
+     */
+    void stopDynamicUpdates() { dynamic_ = false; }
+
 private:
     float sampleRate { config::defaultSampleRate };
     int secondsToSamples(Float timeInSeconds) const noexcept;
@@ -98,7 +105,9 @@ private:
     Float currentValue { 0.0 };
     const EGDescription* desc_ { nullptr };
     const MidiState& midiState_;
+    CurveSet& curveSet_;
     float triggerVelocity_ { 0.0f };
+    bool dynamic_ { false };
     int delay { 0 };
     Float attackStep { 0 };
     Float decayRate { 0 };
